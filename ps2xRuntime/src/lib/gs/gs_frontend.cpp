@@ -135,6 +135,9 @@ namespace
                     return std::make_unique<GSTeeBackend>(std::make_unique<GSCpuBackend>(), std::move(metal));
                 if (const char *v = std::getenv("PS2X_GS_METAL_SELFTEST"))
                     metal->SelfTest(static_cast<uint32_t>(std::max(1024, std::atoi(v))));
+                if (const char *dv = std::getenv("PS2X_GS_METAL_SELFTEST_DRAWS"))
+                    metal->SelfTestDraws(static_cast<uint32_t>(std::max(1, std::atoi(dv))),
+                                         std::getenv("PS2X_GS_METAL_SELFTEST_SEED") ? static_cast<uint32_t>(std::atoi(std::getenv("PS2X_GS_METAL_SELFTEST_SEED"))) : 1u);
                 return metal;
             }
             std::fprintf(stderr, "[gs] PS2X_GS_BACKEND=%s unavailable; using the CPU backend\n", which.c_str());

@@ -1853,6 +1853,15 @@ const uint32_t *GSCpuBackend::ExpandedPalette(const GSDrawState &state)
     return m_palette.data();
 }
 
+const uint32_t *GSCpuBackend::PaletteFor(const GSDrawState &state, uint64_t &generation, uint64_t &key)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const uint32_t *palette = ExpandedPalette(state);
+    generation = m_paletteGeneration;
+    key = m_paletteKey;
+    return palette;
+}
+
 void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     std::lock_guard<std::mutex> lock(m_mutex);

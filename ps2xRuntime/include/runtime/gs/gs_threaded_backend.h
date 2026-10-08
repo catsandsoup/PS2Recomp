@@ -126,6 +126,7 @@ private:
     uint64_t m_completedSeq = 0;
     uint32_t m_presentsInFlight = 0;
     bool m_stop = false;
+    double m_threadCpuSeconds = 0.0; // GS thread CPU time (CLOCK_THREAD_CPUTIME_ID), set when the thread exits
     bool m_consumerWaiting = false;
     mutable Stats m_stats{};
 

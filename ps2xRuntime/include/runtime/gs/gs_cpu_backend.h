@@ -32,6 +32,12 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // Metal backend (G2a): the expanded palette of a draw state (the oracle's own LookupCLUT for every
+    // index of the draw's TEX0/TEXA; 16 entries for 4-bit formats, 256 otherwise) and a stamp that
+    // changes whenever its contents may have changed. The pointer is valid until the next CLUT load
+    // or PaletteFor call with a different state.
+    const uint32_t *PaletteFor(const GSDrawState &state, uint64_t &generation, uint64_t &key);
+
 private:
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);

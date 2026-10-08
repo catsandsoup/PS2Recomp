@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <new>
 
 #if defined(__APPLE__)
@@ -134,6 +135,9 @@ GSThreadedBackend::~GSThreadedBackend()
                     static_cast<unsigned long long>(m_stats.producerStalls),
                     static_cast<unsigned long long>(m_stats.presents),
                     m_pooledBytes);
+        std::printf("[gs-thread] cpu_seconds=%.3f presents=%llu cpu_ms_per_present=%.3f\n", m_threadCpuSeconds,
+                    static_cast<unsigned long long>(m_stats.presents),
+                    m_stats.presents ? 1000.0 * m_threadCpuSeconds / static_cast<double>(m_stats.presents) : 0.0);
         std::fflush(stdout);
     }
     if (m_current)
@@ -273,6 +277,11 @@ void GSThreadedBackend::ThreadMain()
         }
         m_producerCv.notify_all();
     }
+    {
+        timespec ts{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+            m_threadCpuSeconds = static_cast<double>(ts.tv_sec) + 1.0e-9 * static_cast<double>(ts.tv_nsec);
+    }
 }
 
 void GSThreadedBackend::Execute(const Chunk &chunk)
@@ -347,7 +356,10 @@ void GSThreadedBackend::Execute(const Chunk &chunk)
             m_producerCv.notify_all();
             if (gsThrStatsEnabled() && (stats.presents % 250u) == 0u)
             {
-                std::printf("[gs-thread] presents=%llu chunks=%llu drains=%llu stalls=%llu\n",
+                timespec cts{};
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cts); // this is the GS thread
+                std::printf("[gs-thread] gs_cpu_s=%.3f presents=%llu chunks=%llu drains=%llu stalls=%llu\n",
+                            static_cast<double>(cts.tv_sec) + 1.0e-9 * static_cast<double>(cts.tv_nsec),
                             static_cast<unsigned long long>(stats.presents),
                             static_cast<unsigned long long>(stats.chunksPublished),
                             static_cast<unsigned long long>(stats.drains),

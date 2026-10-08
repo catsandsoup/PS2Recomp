@@ -35,15 +35,37 @@ public:
         uint32_t prims = 0;
     };
 
+    // Why a run was closed (commit + wait + write-back).
+    enum FlushWhy : uint32_t
+    {
+        kFlushTarget = 0, // next draw uses another target / run too short
+        kFlushTexOverlap, // a texture samples pages the open run renders to
+        kFlushClut,       // CLUT source pages overlap the run's target
+        kFlushTransfer,   // image transfer touches the run's target pages
+        kFlushFallback,   // per-draw CPU fallback
+        kFlushPresent,
+        kFlushReadback,   // Read/Snapshot/GetTransferSnapshot/ConsumeLocalToHost
+        kFlushOther,      // Initialize/Reset/Flush/Sync/TextureFlush/Clear/WriteVram/limits
+        kFlushWhyCount
+    };
+
     struct Stats
     {
         uint64_t submits = 0;
         uint64_t metalPrims = 0;    // primitives recorded on the Metal path
+        uint64_t metalTexPrims = 0; // ... of which textured (triangles and sprites)
+        uint64_t metalFbPrims = 0;  // ... of which sprites sampling another framebuffer target directly
+        uint64_t metalSelfPrims = 0; // ... of which feedback sprites sampling a snapshot of their own target
         uint64_t fallbackPrims = 0; // primitives rasterised by the CPU fallback
         uint64_t runs = 0;
         uint64_t targetUploads = 0;
         uint64_t readbackPixels = 0;
         uint64_t gpuWaitNs = 0;
+        uint64_t presents = 0;
+        uint64_t texDecodes = 0, texHits = 0, texTexels = 0, palettes = 0, paletteHits = 0;
+        uint64_t flushes[kFlushWhyCount] = {};
+        // PS2X_GS_METAL_TIMING=1: where the GS thread spends its time (ns)
+        uint64_t recordNs = 0, texNs = 0, uploadNs = 0, encodeNs = 0, writebackNs = 0, fallbackNs = 0;
         std::map<std::string, uint64_t> fallbacks; // reason -> primitives
         void Add(const Stats &o);
     };
@@ -86,6 +108,10 @@ public:
     // GPU self-test of the round-toward-zero float and soft-double Z helpers against the host FPU.
     // Returns the number of mismatches over `cases` random inputs (prints a summary line).
     uint64_t SelfTest(uint32_t cases);
+    // Differential test of the textured triangle and sprite paths against GSCpuBackend (the oracle) on random
+    // draw states, under round-toward-zero + FZ and under the default FP mode. Returns the number of
+    // mismatching draws (prints a summary).
+    uint64_t SelfTestDraws(uint32_t draws, uint32_t seed);
 
 private:
     GSMetalBackend();
