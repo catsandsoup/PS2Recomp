@@ -754,7 +754,13 @@ void GSMetalBackend::Stats::Add(const Stats &o)
     palettes += o.palettes;
     paletteHits += o.paletteHits;
     for (uint32_t i = 0; i < kFlushWhyCount; ++i)
+    {
         flushes[i] += o.flushes[i];
+        waits[i] += o.waits[i];
+    }
+    commits += o.commits;
+    partialUploads += o.partialUploads;
+    uploadPixels += o.uploadPixels;
     recordNs += o.recordNs;
     texNs += o.texNs;
     uploadNs += o.uploadNs;
@@ -774,11 +780,19 @@ void GSMetalPrintStats(const char *tag, const GSMetalBackend::Stats &s)
     std::fprintf(stderr, "[gsmtl] %s textures decodes=%llu hits=%llu texels=%llu palettes=%llu palette_hits=%llu fb_target_sprites=%llu self_snapshot_sprites=%llu\n", tag, (unsigned long long)s.texDecodes,
                  (unsigned long long)s.texHits, (unsigned long long)s.texTexels, (unsigned long long)s.palettes, (unsigned long long)s.paletteHits,
                  (unsigned long long)s.metalFbPrims, (unsigned long long)s.metalSelfPrims);
-    static const char *const kWhy[GSMetalBackend::kFlushWhyCount] = {"target", "tex_overlap", "clut", "transfer", "fallback", "present", "readback", "other"};
-    std::fprintf(stderr, "[gsmtl] %s run_closes", tag);
+    static const char *const kWhy[GSMetalBackend::kFlushWhyCount] = {"target", "tex_overlap", "clut", "transfer", "fallback", "present", "readback", "other", "palette", "limit"};
+    std::fprintf(stderr, "[gsmtl] %s run_closes(encodes)", tag);
     for (uint32_t i = 0; i < GSMetalBackend::kFlushWhyCount; ++i)
         std::fprintf(stderr, " %s=%llu", kWhy[i], (unsigned long long)s.flushes[i]);
-    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "\n[gsmtl] %s gpu_waits", tag);
+    uint64_t wsum = 0;
+    for (uint32_t i = 0; i < GSMetalBackend::kFlushWhyCount; ++i)
+    {
+        std::fprintf(stderr, " %s=%llu", kWhy[i], (unsigned long long)s.waits[i]);
+        wsum += s.waits[i];
+    }
+    std::fprintf(stderr, " total=%llu commits=%llu full_uploads=%llu partial_uploads=%llu upload_px=%llu\n", (unsigned long long)wsum, (unsigned long long)s.commits,
+                 (unsigned long long)s.targetUploads, (unsigned long long)s.partialUploads, (unsigned long long)s.uploadPixels);
     if (s.recordNs || s.texNs || s.uploadNs || s.encodeNs || s.writebackNs || s.fallbackNs)
         std::fprintf(stderr, "[gsmtl] %s time_ms record=%.1f tex_decode=%.1f target_upload=%.1f encode=%.1f gpu_wait=%.1f writeback=%.1f cpu_fallback=%.1f\n", tag,
                      double(s.recordNs) / 1e6, double(s.texNs) / 1e6, double(s.uploadNs) / 1e6, double(s.encodeNs) / 1e6, double(s.gpuWaitNs) / 1e6,
@@ -790,15 +804,29 @@ void GSMetalPrintStats(const char *tag, const GSMetalBackend::Stats &s)
 
 struct GSMetalBackend::Impl
 {
+    // One 32-bit-word VRAM surface kept on the GPU (colour planes use the C32 swizzle, depth planes Z24).
+    // Colour and depth are separate planes so that targets sharing a Z buffer share one texture.
+    struct Plane
+    {
+        uint32_t base = 0; // first VRAM page
+        uint32_t fbw = 0;
+        bool depth = false;
+        uint32_t width = 0, height = 0;
+        id<MTLTexture> tex = nil;
+        id<MTLBuffer> wb = nil; // write-back destination (width*height words)
+        std::bitset<kPages> span;  // pages of the whole plane
+        std::bitset<kPages> dirty; // pages the GPU wrote since the last write-back to the shadow
+        int dx0 = 0, dy0 = 0, dx1 = -1, dy1 = -1; // bounding box of the GPU-newer pixels (inclusive)
+        int lpx0 = 1, lpy0 = 1, lpx1 = 0, lpy1 = 0; // last marked page rectangle (fast path)
+        uint64_t syncEpoch = 0;
+        bool valid = false;
+        bool anyDirty() const { return dx1 >= dx0; }
+    };
+
     struct Target
     {
         uint32_t fbp = 0, zbp = 0, fbw = 0;
-        uint32_t width = 0, height = 0;
-        id<MTLTexture> color = nil;
-        id<MTLTexture> depth = nil;
-        id<MTLBuffer> staging = nil; // 2 * width * height words (colour then depth)
-        uint64_t syncEpoch = 0;
-        bool valid = false;
+        Plane *c = nullptr, *z = nullptr;
     };
 
     // ---- textured triangles (G2a)
@@ -862,7 +890,15 @@ struct GSMetalBackend::Impl
 
     std::array<uint64_t, kPages> pageEpoch{};
     uint64_t epoch = 1;
+    std::vector<std::unique_ptr<Plane>> planes;
     std::vector<std::unique_ptr<Target>> targets;
+    bool anyDirtyPlane = false;
+    uint32_t clutCbpMirror[2] = {0xFFFFFFFFu, 0xFFFFFFFFu}; // mirrors GSCpuBackend::m_clutCbp (cld 4/5 skip rule)
+    bool eager = false; // resolve (wait + write back) after every run: M1 behaviour, tee comparisons
+    id<MTLCommandBuffer> cur = nil;
+    std::vector<id<MTLCommandBuffer>> inflightCmds;
+    std::vector<id<MTLBuffer>> freeBufs, inflightBufs;
+    size_t inflightBytes = 0;
 
     // open run
     Target *run = nullptr;
@@ -871,7 +907,6 @@ struct GSMetalBackend::Impl
     std::vector<Segment> segments;
     id<MTLTexture> curTex = nil;
     std::bitset<kPages> runPages; // pages of the run target's colour and Z planes (conservative)
-    int bx0 = 0, by0 = 0, bx1 = -1, by1 = -1;
     uint32_t runPrims = 0;
 
     // texture cache, palette buffer
@@ -882,7 +917,7 @@ struct GSMetalBackend::Impl
     id<MTLTexture> dummyTex = nil;
     std::vector<uint8_t> scratch8;
     std::vector<uint32_t> scratch32;
-    static constexpr uint32_t kPalSlots = 4096u;
+    static constexpr uint32_t kPalSlots = 16384u;
     id<MTLBuffer> palBuf = nil;
     uint32_t palUsed = 0;
     std::unordered_map<uint64_t, uint32_t> palMap;
@@ -917,268 +952,530 @@ struct GSMetalBackend::Impl
         pageEpoch.fill(epoch);
     }
 
-    void TargetPages(const Target &t, bool depth, PageRange &out) const
+    static std::bitset<kPages> BitsOf(const PageRange &r)
     {
-        pagesOfRect((depth ? t.zbp : t.fbp) << 5, t.fbw, GS_PSM_CT32, 0u, 0u, t.width - 1u, t.height - 1u, out);
+        std::bitset<kPages> b;
+        if (r.count >= kPages)
+            b.set();
+        else
+            for (uint32_t i = 0; i < r.count; ++i)
+                b.set(r.pages[i]);
+        return b;
     }
 
-    bool TargetStale(const Target &t) const
+    // ---------------------------------------------------------------- planes, command buffers, pools
+    void ComputeSpan(Plane &p)
     {
-        if (!t.valid)
-            return true;
         PageRange r;
-        for (int d = 0; d < 2; ++d)
-        {
-            TargetPages(t, d != 0, r);
-            for (uint32_t i = 0; i < r.count; ++i)
-                if (pageEpoch[r.pages[i]] > t.syncEpoch)
-                    return true;
-        }
+        pagesOfRect(p.base << 5, p.fbw, GS_PSM_CT32, 0u, 0u, p.width - 1u, p.height - 1u, r);
+        p.span = BitsOf(r);
+    }
+
+    void AllocatePlane(Plane &p, uint32_t height)
+    {
+        p.width = p.fbw * 64u;
+        p.height = height;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+                                                                                     width:p.width
+                                                                                    height:p.height
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        p.tex = [device newTextureWithDescriptor:d];
+        p.wb = [device newBufferWithLength:size_t(p.width) * p.height * 4u options:MTLResourceStorageModeShared];
+        p.valid = false;
+        p.syncEpoch = 0;
+        p.dirty.reset();
+        p.dx0 = p.dy0 = 0;
+        p.dx1 = p.dy1 = -1;
+        p.lpx0 = p.lpy0 = 1;
+        p.lpx1 = p.lpy1 = 0;
+        ComputeSpan(p);
+    }
+
+    Plane *GetPlane(uint32_t base, uint32_t fbw, bool depth, uint32_t needHeight)
+    {
+        const uint32_t height = std::max<uint32_t>(32u, (needHeight + 31u) & ~31u);
+        for (auto &q : planes)
+            if (q->base == base && q->fbw == fbw && q->depth == depth)
+            {
+                if (q->height >= height)
+                    return q.get();
+                // growing loses the texture: its GPU-newer pixels must reach the shadow first
+                std::vector<Plane *> one{q.get()};
+                if (q->anyDirty())
+                    ResolveList(one, kFlushTarget);
+                AllocatePlane(*q, height);
+                return q.get();
+            }
+        auto q = std::make_unique<Plane>();
+        q->base = base;
+        q->fbw = fbw;
+        q->depth = depth;
+        AllocatePlane(*q, height);
+        planes.push_back(std::move(q));
+        return planes.back().get();
+    }
+
+    Target *GetTarget(uint32_t fbp, uint32_t zbp, uint32_t fbw, uint32_t needHeight)
+    {
+        Plane *c = GetPlane(fbp, fbw, false, needHeight);
+        Plane *z = GetPlane(zbp, fbw, true, needHeight);
+        for (auto &t : targets)
+            if (t->fbp == fbp && t->zbp == zbp && t->fbw == fbw)
+                return t.get();
+        auto t = std::make_unique<Target>();
+        t->fbp = fbp;
+        t->zbp = zbp;
+        t->fbw = fbw;
+        t->c = c;
+        t->z = z;
+        targets.push_back(std::move(t));
+        return targets.back().get();
+    }
+
+    bool PlaneStale(const Plane &p) const
+    {
+        if (!p.valid)
+            return true;
+        if (p.syncEpoch == epoch)
+            return false;
+        for (uint32_t i = 0; i < kPages; ++i)
+            if (p.span.test(i) && pageEpoch[i] > p.syncEpoch)
+                return true;
         return false;
     }
 
     void ComputeRunPages()
     {
         runPages.reset();
-        if (!run)
-            return;
-        PageRange r;
-        for (int d = 0; d < 2; ++d)
-        {
-            TargetPages(*run, d != 0, r);
-            for (uint32_t i = 0; i < r.count; ++i)
-                runPages.set(r.pages[i]);
-        }
-    }
-
-    // Does an operation touching these pages need the open run's results in the shadow (or write
-    // pages the run renders to)? A range that hit the 512-entry cap is treated as "everything".
-    bool OverlapsRun(const PageRange &r) const
-    {
-        if (!run)
-            return false;
-        if (flushAll || r.count >= kPages)
-            return true;
-        for (uint32_t i = 0; i < r.count; ++i)
-            if (runPages.test(r.pages[i]))
-                return true;
-        return false;
-    }
-
-    void FlushIfOverlaps(const PageRange &r, FlushWhy why)
-    {
-        if (OverlapsRun(r))
-            FlushRun(why);
-    }
-
-    Target *GetTarget(uint32_t fbp, uint32_t zbp, uint32_t fbw, uint32_t needHeight)
-    {
-        const uint32_t height = std::max<uint32_t>(32u, (needHeight + 31u) & ~31u);
-        for (auto &t : targets)
-        {
-            if (t->fbp == fbp && t->zbp == zbp && t->fbw == fbw)
-            {
-                if (t->height >= height)
-                    return t.get();
-                Allocate(*t, fbw * 64u, height);
-                return t.get();
-            }
-        }
-        auto t = std::make_unique<Target>();
-        t->fbp = fbp;
-        t->zbp = zbp;
-        t->fbw = fbw;
-        Allocate(*t, fbw * 64u, height);
-        targets.push_back(std::move(t));
-        return targets.back().get();
+        if (run)
+            runPages = run->c->span | run->z->span;
     }
 
     // The run's target for this draw (closing the open run when it is another target or too short).
     Target *SelectRun(const GSContext &ctx)
     {
         const uint32_t needHeight = uint32_t(ctx.scissor.y1) + 1u;
-        if (run && run->fbp == ctx.frame.fbp && run->zbp == ctx.zbuf.zbp && run->fbw == ctx.frame.fbw && run->height >= needHeight)
+        if (run && run->fbp == ctx.frame.fbp && run->zbp == ctx.zbuf.zbp && run->fbw == ctx.frame.fbw && run->c->height >= needHeight &&
+            run->z->height >= needHeight)
             return run;
-        FlushRun(kFlushTarget);
+        {
+            static const bool dbg = std::getenv("PS2X_GS_METAL_DBG") != nullptr;
+            static int shown = 0;
+            if (dbg && run && shown++ < 40)
+            {
+                std::fprintf(stderr, "[gsmtl-dbg] switch (fbp=%u zbp=%u fbw=%u prims=%u) -> (fbp=%u zbp=%u fbw=%u need=%u)\n", run->fbp, run->zbp, run->fbw, runPrims,
+                             ctx.frame.fbp, ctx.zbuf.zbp, ctx.frame.fbw, needHeight);
+                std::fflush(stderr);
+            }
+        }
+        CloseRun(kFlushTarget);
         Target *t = GetTarget(ctx.frame.fbp, ctx.zbuf.zbp, ctx.frame.fbw, needHeight);
         run = t;
         ComputeRunPages();
+        // GPU-newer pixels of any other plane sharing pages with this target must reach the shadow first
+        if (anyDirtyPlane)
+            ResolvePlanes(&runPages, false, t->c, t->z, kFlushTarget);
         return t;
     }
 
-    void Allocate(Target &t, uint32_t width, uint32_t height)
+    // ---- GPU resources: one command buffer is filled by consecutive runs and committed without waiting;
+    // buffers it uses come from a pool and are recycled only after a wait.
+    id<MTLCommandBuffer> GetCmd()
     {
-        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
-                                                                                     width:width
-                                                                                    height:height
-                                                                                 mipmapped:NO];
-        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        d.storageMode = MTLStorageModePrivate;
-        t.color = [device newTextureWithDescriptor:d];
-        t.depth = [device newTextureWithDescriptor:d];
-        t.staging = [device newBufferWithLength:size_t(width) * height * 8u options:MTLResourceStorageModeShared];
-        t.width = width;
-        t.height = height;
-        t.valid = false;
+        if (!cur)
+            cur = [queue commandBuffer];
+        return cur;
     }
 
-    // Copy the target's pixels out of the shadow into the staging buffer (raw 32-bit words).
-    void FillStaging(Target &t)
+    void CommitCur()
     {
-        uint32_t *dst = static_cast<uint32_t *>(t.staging.contents);
-        const GSMem::SwizzledSurface<GSMem::C32> cs(t.fbp << 5, t.fbw);
-        const GSMem::SwizzledSurface<GSMem::Z24> zs(t.zbp << 5, t.fbw);
-        uint32_t *dz = dst + size_t(t.width) * t.height;
-        for (uint32_t y = 0; y < t.height; ++y)
-            for (uint32_t x = 0; x < t.width; ++x)
+        if (!cur)
+            return;
+        [cur commit];
+        inflightCmds.push_back(cur);
+        cur = nil;
+        ++frame.commits;
+    }
+
+    id<MTLBuffer> GrabBuf(size_t bytes)
+    {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < freeBufs.size(); ++i)
+            if (freeBufs[i].length >= bytes && (best == SIZE_MAX || freeBufs[i].length < freeBufs[best].length))
+                best = i;
+        id<MTLBuffer> b;
+        if (best != SIZE_MAX)
+        {
+            b = freeBufs[best];
+            freeBufs.erase(freeBufs.begin() + std::ptrdiff_t(best));
+        }
+        else
+        {
+            size_t len = std::max<size_t>(bytes + bytes / 2u, size_t(256u) << 10);
+            len = (len + 65535u) & ~size_t(65535u);
+            b = [device newBufferWithLength:len options:MTLResourceStorageModeShared];
+        }
+        inflightBufs.push_back(b);
+        inflightBytes += b.length;
+        return b;
+    }
+
+    // Wait for every committed command buffer (they run in order); recycles pool buffers and the palette ring.
+    void WaitAll(FlushWhy why)
+    {
+        if (!inflightCmds.empty())
+        {
+            const uint64_t t0 = nowNs();
+            for (id<MTLCommandBuffer> c : inflightCmds)
             {
-                uint32_t v;
-                std::memcpy(&v, vram + cs.Locate(x, y).byteAddress, 4);
-                dst[size_t(y) * t.width + x] = v;
-                std::memcpy(&v, vram + zs.Locate(x, y).byteAddress, 4);
-                dz[size_t(y) * t.width + x] = v;
+                [c waitUntilCompleted];
+                if (c.status == MTLCommandBufferStatusError)
+                {
+                    std::fprintf(stderr, "[gsmtl] command buffer error: %s\n", c.error.localizedDescription.UTF8String);
+                    std::fflush(stderr);
+                }
+            }
+            frame.gpuWaitNs += nowNs() - t0;
+            ++frame.waits[why];
+            inflightCmds.clear();
+        }
+        for (id<MTLBuffer> b : inflightBufs)
+            freeBufs.push_back(b);
+        inflightBufs.clear();
+        inflightBytes = 0;
+        ResetPalettes();
+    }
+
+    void ResetPalettes()
+    {
+        if (inflightCmds.empty() && prims.empty() && !cur)
+        {
+            palUsed = 0;
+            palMap.clear();
+            lastPalValid = false;
+        }
+    }
+
+    // ---- uploading the shadow into a plane (stale pages only)
+    struct PageRect
+    {
+        uint32_t x, y, w, h;
+    };
+
+    void EncodeRefill(Plane &p)
+    {
+        if (p.valid && p.syncEpoch == epoch)
+            return;
+        std::vector<PageRect> rects;
+        if (!p.valid)
+            rects.push_back({0u, 0u, p.width, p.height});
+        else
+        {
+            const uint32_t rows = p.height / 32u;
+            for (uint32_t py = 0; py < rows; ++py)
+            {
+                int run0 = -1;
+                for (uint32_t px = 0; px <= p.fbw; ++px)
+                {
+                    const bool st = px < p.fbw && pageEpoch[(p.base + py * p.fbw + px) % kPages] > p.syncEpoch;
+                    if (st && run0 < 0)
+                        run0 = int(px);
+                    else if (!st && run0 >= 0)
+                    {
+                        rects.push_back({uint32_t(run0) * 64u, py * 32u, (px - uint32_t(run0)) * 64u, 32u});
+                        run0 = -1;
+                    }
+                }
+            }
+        }
+        p.syncEpoch = epoch;
+        const bool wasValid = p.valid;
+        p.valid = true;
+        if (rects.empty())
+            return;
+        const uint64_t tu0 = timing ? nowNs() : 0;
+        size_t words = 0;
+        for (const PageRect &r : rects)
+            words += size_t(r.w) * r.h;
+        id<MTLBuffer> up = GrabBuf(words * 4u);
+        uint32_t *dst = static_cast<uint32_t *>(up.contents);
+        const GSMem::SwizzledSurface<GSMem::C32> cs(p.base << 5, p.fbw);
+        const GSMem::SwizzledSurface<GSMem::Z24> zs(p.base << 5, p.fbw);
+        size_t off = 0;
+        for (const PageRect &r : rects)
+        {
+            for (uint32_t y = 0; y < r.h; ++y)
+                for (uint32_t x = 0; x < r.w; ++x)
+                {
+                    const uint32_t byteAddress = p.depth ? zs.Locate(r.x + x, r.y + y).byteAddress : cs.Locate(r.x + x, r.y + y).byteAddress;
+                    std::memcpy(&dst[off + size_t(y) * r.w + x], vram + byteAddress, 4);
+                }
+            off += size_t(r.w) * r.h;
+        }
+        id<MTLCommandBuffer> cmd = GetCmd();
+        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+        off = 0;
+        for (const PageRect &r : rects)
+        {
+            [blit copyFromBuffer:up sourceOffset:off * 4u sourceBytesPerRow:r.w * 4u sourceBytesPerImage:size_t(r.w) * r.h * 4u
+                      sourceSize:MTLSizeMake(r.w, r.h, 1) toTexture:p.tex destinationSlice:0 destinationLevel:0
+               destinationOrigin:MTLOriginMake(r.x, r.y, 0)];
+            off += size_t(r.w) * r.h;
+        }
+        [blit endEncoding];
+        if (!wasValid)
+            ++frame.targetUploads;
+        else
+            ++frame.partialUploads;
+        frame.uploadPixels += words;
+        if (timing)
+            frame.uploadNs += nowNs() - tu0;
+    }
+
+    // ---- GPU-newer pixels -> shadow
+    void MarkDirty(Plane &p, int x0, int y0, int x1, int y1)
+    {
+        if (p.dx1 < p.dx0)
+        {
+            p.dx0 = x0;
+            p.dy0 = y0;
+            p.dx1 = x1;
+            p.dy1 = y1;
+        }
+        else
+        {
+            p.dx0 = std::min(p.dx0, x0);
+            p.dy0 = std::min(p.dy0, y0);
+            p.dx1 = std::max(p.dx1, x1);
+            p.dy1 = std::max(p.dy1, y1);
+        }
+        anyDirtyPlane = true;
+        const int px0 = x0 >> 6, px1 = x1 >> 6, py0 = y0 >> 5, py1 = y1 >> 5;
+        if (px0 >= p.lpx0 && px1 <= p.lpx1 && py0 >= p.lpy0 && py1 <= p.lpy1)
+            return;
+        for (int py = py0; py <= py1; ++py)
+            for (int px = px0; px <= px1; ++px)
+                p.dirty.set((p.base + uint32_t(py) * p.fbw + uint32_t(px)) % kPages);
+        p.lpx0 = px0;
+        p.lpx1 = px1;
+        p.lpy0 = py0;
+        p.lpy1 = py1;
+    }
+
+    // Brings the shadow up to date for the given planes: encodes the open run when it renders to one of
+    // them, copies each plane's dirty rectangle into its write-back buffer, waits, swizzles it into the
+    // shadow and marks the pages written.
+    void ResolveList(std::vector<Plane *> &L, FlushWhy why)
+    {
+        if (L.empty())
+            return;
+        @autoreleasepool
+        {
+            if (run)
+                for (Plane *p : L)
+                    if (p == run->c || p == run->z)
+                    {
+                        CloseRun(why);
+                        break;
+                    }
+            L.erase(std::remove_if(L.begin(), L.end(), [](Plane *q) { return !q->anyDirty(); }), L.end());
+            if (L.empty())
+                return;
+            for (Plane *p : L)
+                EncodeRefill(*p);
+            id<MTLCommandBuffer> cmd = GetCmd();
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            for (Plane *p : L)
+            {
+                const uint32_t w = uint32_t(p->dx1 - p->dx0 + 1), h = uint32_t(p->dy1 - p->dy0 + 1);
+                [blit copyFromTexture:p->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(p->dx0, p->dy0, 0)
+                           sourceSize:MTLSizeMake(w, h, 1) toBuffer:p->wb destinationOffset:0
+                  destinationBytesPerRow:w * 4u destinationBytesPerImage:size_t(w) * h * 4u];
+            }
+            [blit endEncoding];
+            CommitCur();
+            WaitAll(why);
+        }
+        for (Plane *p : L)
+        {
+            const uint64_t tw0 = timing ? nowNs() : 0;
+            const uint32_t w = uint32_t(p->dx1 - p->dx0 + 1), h = uint32_t(p->dy1 - p->dy0 + 1);
+            const uint32_t *src = static_cast<const uint32_t *>(p->wb.contents);
+            if (p->depth)
+            {
+                const GSMem::SwizzledSurface<GSMem::Z24> zs(p->base << 5, p->fbw);
+                for (uint32_t y = 0; y < h; ++y)
+                    for (uint32_t x = 0; x < w; ++x)
+                        std::memcpy(vram + zs.Locate(uint32_t(p->dx0) + x, uint32_t(p->dy0) + y).byteAddress, &src[size_t(y) * w + x], 4);
+            }
+            else
+            {
+                const GSMem::SwizzledSurface<GSMem::C32> cs(p->base << 5, p->fbw);
+                for (uint32_t y = 0; y < h; ++y)
+                    for (uint32_t x = 0; x < w; ++x)
+                        std::memcpy(vram + cs.Locate(uint32_t(p->dx0) + x, uint32_t(p->dy0) + y).byteAddress, &src[size_t(y) * w + x], 4);
+            }
+            frame.readbackPixels += uint64_t(w) * h;
+            PageRange r;
+            pagesOfRect(p->base << 5, p->fbw, GS_PSM_CT32, uint32_t(p->dx0), uint32_t(p->dy0), uint32_t(p->dx1), uint32_t(p->dy1), r);
+            MarkPages(r);
+            p->syncEpoch = epoch; // the plane equals the shadow again
+            RunInfo info;
+            info.fbp = p->base;
+            info.zbp = p->depth ? p->base : 0u;
+            info.fbw = p->fbw;
+            info.x0 = p->dx0;
+            info.y0 = p->dy0;
+            info.x1 = p->dx1;
+            info.y1 = p->dy1;
+            info.prims = 0;
+            p->dirty.reset();
+            p->dx0 = p->dy0 = 0;
+            p->dx1 = p->dy1 = -1;
+            p->lpx0 = p->lpy0 = 1;
+            p->lpx1 = p->lpy1 = 0;
+            ++frame.runs;
+            if (timing)
+                frame.writebackNs += nowNs() - tw0;
+            if (observer && !p->depth)
+                observer(info);
+        }
+        anyDirtyPlane = false;
+        for (auto &q : planes)
+            if (q->anyDirty())
+            {
+                anyDirtyPlane = true;
+                break;
             }
     }
 
-    void FlushRun(FlushWhy why = kFlushOther)
+    // Resolve every plane with GPU-newer pixels on `pages` (nullptr = anywhere); optionally colour planes only.
+    bool ResolvePlanes(const std::bitset<kPages> *pages, bool colorOnly, const Plane *skipA, const Plane *skipB, FlushWhy why)
+    {
+        if (!anyDirtyPlane)
+            return false;
+        std::vector<Plane *> L;
+        for (auto &q : planes)
+        {
+            if (!q->anyDirty() || (colorOnly && q->depth) || q.get() == skipA || q.get() == skipB)
+                continue;
+            if (pages && (q->dirty & *pages).none())
+                continue;
+            L.push_back(q.get());
+        }
+        if (L.empty())
+            return false;
+        ResolveList(L, why);
+        return true;
+    }
+
+    void ResolveAll(FlushWhy why)
+    {
+        CloseRun(why);
+        ResolvePlanes(nullptr, false, nullptr, nullptr, why);
+    }
+
+    // Everything submitted has finished (destructor, public FlushRun).
+    void Drain(FlushWhy why)
+    {
+        ResolveAll(why);
+        if (!inflightCmds.empty() || cur)
+        {
+            CommitCur();
+            WaitAll(why);
+        }
+    }
+
+    // A CPU read of VRAM pages (CLUT, texture decode, transfer source).
+    void CpuRead(const PageRange &r, FlushWhy why)
+    {
+        if (!anyDirtyPlane)
+            return;
+        const std::bitset<kPages> b = BitsOf(r);
+        ResolvePlanes(&b, false, nullptr, nullptr, why);
+    }
+
+    // A CPU write of VRAM pages: GPU-newer pixels there reach the shadow first, and a run rendering to
+    // those pages ends so that its target is refilled afterwards.
+    void CpuWrite(const PageRange &r, FlushWhy why)
+    {
+        if (!run && !anyDirtyPlane)
+            return;
+        const std::bitset<kPages> b = BitsOf(r);
+        ResolvePlanes(&b, false, nullptr, nullptr, why);
+        if (run && (runPages & b).any())
+            CloseRun(why);
+    }
+
+    // Encode (and commit, without waiting) the open run.
+    void CloseRun(FlushWhy why = kFlushOther)
     {
         if (!run)
             return;
         Target &t = *run;
-        @autoreleasepool
+        const bool draw = !prims.empty();
+        if (draw)
         {
-            const bool stale = TargetStale(t);
-            if (!prims.empty() || stale)
+            @autoreleasepool
             {
                 ++frame.flushes[why];
-                id<MTLCommandBuffer> cmd = [queue commandBuffer];
-                const size_t plane = size_t(t.width) * t.height * 4u;
-                if (stale)
+                const uint64_t te0 = timing ? nowNs() : 0;
+                EncodeRefill(*t.c);
+                EncodeRefill(*t.z);
+                id<MTLCommandBuffer> cmd = GetCmd();
+                if (snapTex && snapTarget == &t)
                 {
-                    const uint64_t tu0 = timing ? nowNs() : 0;
-                    FillStaging(t);
-                    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                    [blit copyFromBuffer:t.staging sourceOffset:0 sourceBytesPerRow:t.width * 4u sourceBytesPerImage:plane
-                              sourceSize:MTLSizeMake(t.width, t.height, 1) toTexture:t.color destinationSlice:0 destinationLevel:0
-                       destinationOrigin:MTLOriginMake(0, 0, 0)];
-                    [blit copyFromBuffer:t.staging sourceOffset:plane sourceBytesPerRow:t.width * 4u sourceBytesPerImage:plane
-                              sourceSize:MTLSizeMake(t.width, t.height, 1) toTexture:t.depth destinationSlice:0 destinationLevel:0
-                       destinationOrigin:MTLOriginMake(0, 0, 0)];
-                    [blit endEncoding];
-                    ++frame.targetUploads;
-                    t.valid = true;
-                    t.syncEpoch = epoch;
-                    if (timing)
-                        frame.uploadNs += nowNs() - tu0;
+                    id<MTLBlitCommandEncoder> sb = [cmd blitCommandEncoder];
+                    [sb copyFromTexture:t.c->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                             sourceSize:MTLSizeMake(t.c->width, t.c->height, 1) toTexture:snapTex destinationSlice:0 destinationLevel:0
+                      destinationOrigin:MTLOriginMake(0, 0, 0)];
+                    [sb endEncoding];
                 }
-                const bool draw = !prims.empty() && bx1 >= bx0 && by1 >= by0;
-                if (draw)
+                id<MTLBuffer> vb = GrabBuf(verts.size() * sizeof(GPUVertex));
+                std::memcpy(vb.contents, verts.data(), verts.size() * sizeof(GPUVertex));
+                id<MTLBuffer> pb = GrabBuf(prims.size() * sizeof(GPUPrim));
+                std::memcpy(pb.contents, prims.data(), prims.size() * sizeof(GPUPrim));
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = t.c->tex;
+                rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[1].texture = t.z->tex;
+                rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
+                rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+                id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+                [enc setRenderPipelineState:pipeline];
+                MTLViewport vp = {0.0, 0.0, double(t.c->width), double(t.c->height), 0.0, 1.0};
+                [enc setViewport:vp];
+                const float size[2] = {float(t.c->width), float(t.c->height)};
+                [enc setVertexBuffer:vb offset:0 atIndex:0];
+                [enc setVertexBytes:size length:sizeof(size) atIndex:1];
+                [enc setFragmentBuffer:pb offset:0 atIndex:0];
+                [enc setFragmentBuffer:palBuf offset:0 atIndex:1];
+                if (segments.empty())
                 {
-                    const uint64_t te0 = timing ? nowNs() : 0;
-                    if (snapTex && snapTarget == &t)
+                    [enc setFragmentTexture:dummyTex atIndex:0];
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:verts.size()];
+                }
+                else
+                {
+                    for (size_t i = 0; i < segments.size(); ++i)
                     {
-                        id<MTLBlitCommandEncoder> sb = [cmd blitCommandEncoder];
-                        [sb copyFromTexture:t.color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                                 sourceSize:MTLSizeMake(t.width, t.height, 1) toTexture:snapTex destinationSlice:0 destinationLevel:0
-                          destinationOrigin:MTLOriginMake(0, 0, 0)];
-                        [sb endEncoding];
+                        const uint32_t first = segments[i].first;
+                        const uint32_t last = (i + 1 < segments.size()) ? segments[i + 1].first : uint32_t(verts.size());
+                        if (last <= first)
+                            continue;
+                        [enc setFragmentTexture:segments[i].tex atIndex:0];
+                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:first vertexCount:last - first];
                     }
-                    id<MTLBuffer> vb = [device newBufferWithBytes:verts.data() length:verts.size() * sizeof(GPUVertex) options:MTLResourceStorageModeShared];
-                    id<MTLBuffer> pb = [device newBufferWithBytes:prims.data() length:prims.size() * sizeof(GPUPrim) options:MTLResourceStorageModeShared];
-                    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-                    rp.colorAttachments[0].texture = t.color;
-                    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
-                    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-                    rp.colorAttachments[1].texture = t.depth;
-                    rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
-                    rp.colorAttachments[1].storeAction = MTLStoreActionStore;
-                    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
-                    [enc setRenderPipelineState:pipeline];
-                    MTLViewport vp = {0.0, 0.0, double(t.width), double(t.height), 0.0, 1.0};
-                    [enc setViewport:vp];
-                    const float size[2] = {float(t.width), float(t.height)};
-                    [enc setVertexBuffer:vb offset:0 atIndex:0];
-                    [enc setVertexBytes:size length:sizeof(size) atIndex:1];
-                    [enc setFragmentBuffer:pb offset:0 atIndex:0];
-                    [enc setFragmentBuffer:palBuf offset:0 atIndex:1];
-                    if (segments.empty())
-                    {
-                        [enc setFragmentTexture:dummyTex atIndex:0];
-                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:verts.size()];
-                    }
-                    else
-                    {
-                        for (size_t i = 0; i < segments.size(); ++i)
-                        {
-                            const uint32_t first = segments[i].first;
-                            const uint32_t last = (i + 1 < segments.size()) ? segments[i + 1].first : uint32_t(verts.size());
-                            if (last <= first)
-                                continue;
-                            [enc setFragmentTexture:segments[i].tex atIndex:0];
-                            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:first vertexCount:last - first];
-                        }
-                    }
-                    [enc endEncoding];
-
-                    // dirty rectangle back into the staging buffer (colour plane, then depth plane)
-                    const uint32_t w = uint32_t(bx1 - bx0 + 1), h = uint32_t(by1 - by0 + 1);
-                    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                    [blit copyFromTexture:t.color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(bx0, by0, 0)
-                               sourceSize:MTLSizeMake(w, h, 1) toBuffer:t.staging destinationOffset:0
-                      destinationBytesPerRow:w * 4u destinationBytesPerImage:size_t(w) * h * 4u];
-                    [blit copyFromTexture:t.depth sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(bx0, by0, 0)
-                               sourceSize:MTLSizeMake(w, h, 1) toBuffer:t.staging destinationOffset:plane
-                      destinationBytesPerRow:w * 4u destinationBytesPerImage:size_t(w) * h * 4u];
-                    [blit endEncoding];
-                    if (timing)
-                        frame.encodeNs += nowNs() - te0;
                 }
-                const uint64_t t0 = nowNs();
-                [cmd commit];
-                [cmd waitUntilCompleted];
-                frame.gpuWaitNs += nowNs() - t0;
-                if (cmd.status == MTLCommandBufferStatusError)
-                {
-                    std::fprintf(stderr, "[gsmtl] command buffer error: %s\n", cmd.error.localizedDescription.UTF8String);
-                    std::fflush(stderr);
-                }
-                if (draw)
-                {
-                    const uint64_t tw0 = timing ? nowNs() : 0;
-                    const uint32_t w = uint32_t(bx1 - bx0 + 1), h = uint32_t(by1 - by0 + 1);
-                    const uint32_t *src = static_cast<const uint32_t *>(t.staging.contents);
-                    const uint32_t *srcZ = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(t.staging.contents) + plane);
-                    const GSMem::SwizzledSurface<GSMem::C32> cs(t.fbp << 5, t.fbw);
-                    const GSMem::SwizzledSurface<GSMem::Z24> zs(t.zbp << 5, t.fbw);
-                    for (uint32_t y = 0; y < h; ++y)
-                        for (uint32_t x = 0; x < w; ++x)
-                        {
-                            std::memcpy(vram + cs.Locate(uint32_t(bx0) + x, uint32_t(by0) + y).byteAddress, &src[size_t(y) * w + x], 4);
-                            std::memcpy(vram + zs.Locate(uint32_t(bx0) + x, uint32_t(by0) + y).byteAddress, &srcZ[size_t(y) * w + x], 4);
-                        }
-                    frame.readbackPixels += uint64_t(w) * h;
-                    PageRange r;
-                    pagesOfRect(t.fbp << 5, t.fbw, GS_PSM_CT32, uint32_t(bx0), uint32_t(by0), uint32_t(bx1), uint32_t(by1), r);
-                    MarkPages(r);
-                    pagesOfRect(t.zbp << 5, t.fbw, GS_PSM_Z24, uint32_t(bx0), uint32_t(by0), uint32_t(bx1), uint32_t(by1), r);
-                    MarkPages(r);
-                    t.syncEpoch = epoch; // the target equals the shadow again
-                    ++frame.runs;
-                    if (timing)
-                        frame.writebackNs += nowNs() - tw0;
-                }
+                [enc endEncoding];
+                CommitCur();
+                if (timing)
+                    frame.encodeNs += nowNs() - te0;
             }
         }
-        RunInfo info;
-        info.fbp = t.fbp;
-        info.zbp = t.zbp;
-        info.fbw = t.fbw;
-        info.x0 = bx0;
-        info.y0 = by0;
-        info.x1 = bx1;
-        info.y1 = by1;
-        info.prims = runPrims;
-        const bool drew = !prims.empty() && bx1 >= bx0 && by1 >= by0;
         run = nullptr;
         snapTex = nil;
         snapTarget = nullptr;
@@ -1187,15 +1484,18 @@ struct GSMetalBackend::Impl
         segments.clear();
         curTex = nil;
         runPages.reset();
-        palUsed = 0;
-        palMap.clear();
-        lastPalValid = false;
-        bx0 = by0 = 0;
-        bx1 = by1 = -1;
         runPrims = 0;
-        if (drew && observer)
-            observer(info);
+        if (draw)
+        {
+            if (inflightBytes > (size_t(256) << 20))
+                WaitAll(kFlushLimit);
+            else if (eager)
+                ResolveAll(why);
+        }
     }
+
+    // compatibility name used throughout
+    void FlushRun(FlushWhy why = kFlushOther) { ResolveAll(why); }
 
     // CPU-side writes: mark pages the operation can touch.
     void MarkCpuDraw(const GSPrimitiveBatch &batch)
@@ -1385,20 +1685,31 @@ struct GSMetalBackend::Impl
         if (inserted)
             TexturePages(ts.key, e.pages);
         e.lastUse = ++useTick;
-        if (run && !flushAll)
+        if (anyDirtyPlane)
         {
-            for (uint16_t p : e.pages)
-                if (runPages.test(p))
-                {
-                    FlushRun(kFlushTexOverlap);
-                    SelectRun(ctx);
+            // texels the GPU has rendered since the last write-back must reach the shadow before decoding
+            bool hit = false;
+            for (auto &q : planes)
+            {
+                if (!q->anyDirty())
+                    continue;
+                for (uint16_t p : e.pages)
+                    if (q->dirty.test(p))
+                    {
+                        hit = true;
+                        break;
+                    }
+                if (hit)
                     break;
-                }
-        }
-        else if (run && flushAll)
-        {
-            FlushRun(kFlushTexOverlap);
-            SelectRun(ctx);
+            }
+            if (hit)
+            {
+                std::bitset<kPages> b;
+                for (uint16_t p : e.pages)
+                    b.set(p);
+                ResolvePlanes(&b, false, nullptr, nullptr, kFlushTexOverlap);
+                SelectRun(ctx);
+            }
         }
         bool fresh = !e.tex;
         if (!fresh && e.checked != epoch)
@@ -1463,7 +1774,9 @@ struct GSMetalBackend::Impl
                 {
                     if (palUsed >= kPalSlots)
                     {
-                        FlushRun(kFlushOther);
+                        CloseRun(kFlushPalette);
+                        CommitCur();
+                        WaitAll(kFlushPalette);
                         SelectRun(ctx);
                     }
                     slot = palUsed++;
@@ -1643,18 +1956,6 @@ struct GSMetalBackend::Impl
         return linear && r.fracHi == 0.0f;
     }
 
-    bool ColorStale(const Target &t) const
-    {
-        if (!t.valid)
-            return true;
-        PageRange r;
-        TargetPages(t, false, r);
-        for (uint32_t i = 0; i < r.count; ++i)
-            if (pageEpoch[r.pages[i]] > t.syncEpoch)
-                return true;
-        return false;
-    }
-
     // Samples a framebuffer target's own MTLTexture (the full-screen CT24/CT32 "previous frame" sprite)
     // instead of decoding the shadow. Leaves the texture in primTex / fbSrc; false = use the normal path.
     bool TryFbTexture(const GSContext &ctx)
@@ -1671,8 +1972,8 @@ struct GSMetalBackend::Impl
                     std::fprintf(stderr, "[gsmtl-dbg] fb reject %s: tbp=%u tbw=%u psm=%u tex=%ux%u wms=%u wmt=%u lin=%d fst=%d | run fbp=%u zbp=%u fbw=%u | sprite %d,%d..%d,%d u=%.3f..%.3f v=%.3f..%.3f | targets:",
                                  why, ts.key.tbp, ts.key.tbw, ts.key.psm, ts.texW, ts.texH, ts.wms, ts.wmt, ts.linear, ts.fst, run ? run->fbp : 0u, run ? run->zbp : 0u,
                                  run ? run->fbw : 0u, sg.gx0, sg.gy0, sg.gx1, sg.gy1, sg.u0f, sg.u1f, sg.v0f, sg.v1f);
-                    for (auto &t : targets)
-                        std::fprintf(stderr, " (fbp=%u fbw=%u h=%u valid=%d stale=%d)", t->fbp, t->fbw, t->height, t->valid, ColorStale(*t));
+                    for (auto &q : planes)
+                        std::fprintf(stderr, " (%s base=%u fbw=%u h=%u valid=%d stale=%d)", q->depth ? "z" : "c", q->base, q->fbw, q->height, q->valid, PlaneStale(*q));
                     std::fprintf(stderr, "\n");
                     std::fflush(stderr);
                 }
@@ -1681,27 +1982,29 @@ struct GSMetalBackend::Impl
         };
         if (!sg.ok || (ts.key.psm != GS_PSM_CT32 && ts.key.psm != GS_PSM_CT24) || ts.wms == 3u || ts.wmt == 3u || !run)
             return reject("psm_wrap");
-        Target *T = nullptr;
+        Plane *T = nullptr;
         bool self = false;
         if ((run->fbp << 5) == ts.key.tbp && run->fbw == ts.key.tbw)
         {
-            T = run;
+            T = run->c;
             self = true;
         }
         else
         {
-            for (auto &t : targets)
-                if (t.get() != run && t->valid && (t->fbp << 5) == ts.key.tbp && t->fbw == ts.key.tbw && !ColorStale(*t))
+            for (auto &q : planes)
+                if (q.get() != run->c && !q->depth && q->valid && (q->base << 5) == ts.key.tbp && q->fbw == ts.key.tbw && !PlaneStale(*q))
                 {
-                    T = t.get();
+                    T = q.get();
                     break;
                 }
             if (!T)
                 return reject("no_target");
-            PageRange r;
-            pagesOfRect(T->fbp << 5, T->fbw, GS_PSM_CT32, 0u, 0u, T->width - 1u, T->height - 1u, r);
-            if (OverlapsRun(r))
+            if ((T->span & runPages).any())
                 return reject("run_overlap");
+            // pixels another plane has drawn on these pages are not in this texture
+            for (auto &q : planes)
+                if (q.get() != T && q->anyDirty() && (q->dirty & T->span).any())
+                    return reject("dirty_other");
         }
         const bool fst = ts.fst;
         const float cu0 = SpriteCoord(sg.gx0, sg.un0x, sg.w, sg.u0f, sg.u1f, fst), cu1 = SpriteCoord(sg.gx1, sg.un0x, sg.w, sg.u0f, sg.u1f, fst);
@@ -1714,9 +2017,9 @@ struct GSMetalBackend::Impl
         {
             if (!prims.empty())
             {
-                FlushRun(kFlushTexOverlap);
+                CloseRun(kFlushTexOverlap);
                 SelectRun(ctx);
-                T = run;
+                T = run->c;
             }
             if (!snapTex || snapTex.width != T->width || snapTex.height != T->height)
             {
@@ -1728,13 +2031,13 @@ struct GSMetalBackend::Impl
                 d.storageMode = MTLStorageModePrivate;
                 snapTex = [device newTextureWithDescriptor:d];
             }
-            snapTarget = T;
+            snapTarget = run;
             primTex = snapTex;
             ++frame.metalSelfPrims;
         }
         else
         {
-            primTex = T->color;
+            primTex = T->tex;
             ++frame.metalFbPrims;
         }
         fbSrc = true;
@@ -1958,20 +2261,9 @@ struct GSMetalBackend::Impl
         verts.push_back({fx1, fy0, index});
         verts.push_back({fx1, fy1, index});
         verts.push_back({fx0, fy1, index});
-        if (bx1 < bx0)
-        {
-            bx0 = x0;
-            by0 = y0;
-            bx1 = x1;
-            by1 = y1;
-        }
-        else
-        {
-            bx0 = std::min(bx0, x0);
-            by0 = std::min(by0, y0);
-            bx1 = std::max(bx1, x1);
-            by1 = std::max(by1, y1);
-        }
+        MarkDirty(*run->c, x0, y0, x1, y1);
+        if (!ctx.zbuf.zmask)
+            MarkDirty(*run->z, x0, y0, x1, y1);
     }
 };
 
@@ -1981,7 +2273,7 @@ GSMetalBackend::~GSMetalBackend()
 {
     if (m)
     {
-        m->FlushRun();
+        m->Drain(kFlushOther);
         Stats t = m->total;
         t.Add(m->frame);
         GSMetalPrintStats("total", t);
@@ -2041,6 +2333,7 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
         b->m->cpu = std::make_unique<GSCpuBackend>();
         b->m->timing = std::getenv("PS2X_GS_METAL_TIMING") != nullptr;
         b->m->flushAll = std::getenv("PS2X_GS_METAL_FLUSH_ALL") != nullptr;
+        b->m->eager = b->m->flushAll;
         b->m->palBuf = [device newBufferWithLength:size_t(Impl::kPalSlots) * 256u * 4u options:MTLResourceStorageModeShared];
         {
             MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Uint width:1 height:1 mipmapped:NO];
@@ -2058,7 +2351,7 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
 
 void GSMetalBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {
-    m->FlushRun();
+    m->ResolveAll(kFlushOther);
     m->vram = vram;
     m->vramSize = vramSize;
     m->cpu->Initialize(vram, vramSize);
@@ -2067,7 +2360,7 @@ void GSMetalBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 
 void GSMetalBackend::Reset()
 {
-    m->FlushRun();
+    m->ResolveAll(kFlushOther);
     m->cpu->Reset();
 }
 
@@ -2079,7 +2372,7 @@ void GSMetalBackend::Submit(const GSPrimitiveBatch &batch)
     const uint64_t t0 = m->timing ? nowNs() : 0;
     const auto fallback = [&](const char *reason)
     {
-        m->FlushRun(kFlushFallback);
+        m->ResolveAll(kFlushFallback);
         m->cpu->Submit(batch);
         m->MarkCpuDraw(batch);
         ++m->frame.fallbackPrims;
@@ -2115,7 +2408,7 @@ void GSMetalBackend::Submit(const GSPrimitiveBatch &batch)
                     const auto &sgm = m->sg;
                     std::fprintf(stderr, "[gsmtl-dbg] tex_self: tbp=%u tbw=%u psm=%u tex=%ux%u wms=%u wmt=%u lin=%d fst=%d | run fbp=%u zbp=%u fbw=%u h=%u | sprite %d,%d..%d,%d u=%.3f..%.3f v=%.3f..%.3f\n",
                                  m->ts.key.tbp, m->ts.key.tbw, m->ts.key.psm, m->ts.texW, m->ts.texH, m->ts.wms, m->ts.wmt, m->ts.linear, m->ts.fst,
-                                 m->run ? m->run->fbp : 0u, m->run ? m->run->zbp : 0u, m->run ? m->run->fbw : 0u, m->run ? m->run->height : 0u, sgm.gx0, sgm.gy0, sgm.gx1,
+                                 m->run ? m->run->fbp : 0u, m->run ? m->run->zbp : 0u, m->run ? m->run->fbw : 0u, m->run ? m->run->c->height : 0u, sgm.gx0, sgm.gy0, sgm.gx1,
                                  sgm.gy1, sgm.u0f, sgm.u1f, sgm.v0f, sgm.v1f);
                     {
                         const bool fst2 = m->ts.fst;
@@ -2149,14 +2442,32 @@ void GSMetalBackend::Submit(const GSPrimitiveBatch &batch)
     m->BindSegment(m->ts.on ? m->primTex : nil);
     m->Record(batch, rtz);
     if (m->prims.size() >= 65536u)
-        m->FlushRun(kFlushOther);
+        m->CloseRun(kFlushLimit);
     if (m->timing)
         m->frame.recordNs += nowNs() - t0 - tTex;
 }
 
 void GSMetalBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
-    if (m->run)
+    // Same filter as GSCpuBackend::LoadClut: only indexed textures with a CLD that loads read VRAM here.
+    bool loads = tex0.psm == GS_PSM_T4 || tex0.psm == GS_PSM_T4HL || tex0.psm == GS_PSM_T4HH || tex0.psm == GS_PSM_T8 || tex0.psm == GS_PSM_T8H;
+    if (loads)
+    {
+        switch (tex0.cld)
+        {
+        case 1u: break;
+        case 2u: m->clutCbpMirror[0] = tex0.cbp; break;
+        case 3u: m->clutCbpMirror[1] = tex0.cbp; break;
+        case 4u:
+            if (m->clutCbpMirror[0] == tex0.cbp) loads = false; else m->clutCbpMirror[0] = tex0.cbp;
+            break;
+        case 5u:
+            if (m->clutCbpMirror[1] == tex0.cbp) loads = false; else m->clutCbpMirror[1] = tex0.cbp;
+            break;
+        default: loads = false; break;
+        }
+    }
+    if (loads && m->anyDirtyPlane)
     {
         // The CLUT is read from VRAM here (CSM1: a 16x16 block at CBP; CSM2: a row at COU/COV).
         PageRange r;
@@ -2165,7 +2476,23 @@ void GSMetalBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut
         else
             pagesOfRect(tex0.cbp, std::max<uint32_t>(texclut.cbw, 1u), tex0.cpsm, uint32_t(texclut.cou) << 4, texclut.cov,
                         (uint32_t(texclut.cou) << 4) + 255u, texclut.cov, r);
-        m->FlushIfOverlaps(r, kFlushClut);
+        {
+            static const bool dbg = std::getenv("PS2X_GS_METAL_DBG") != nullptr;
+            static int shown = 0;
+            if (dbg && shown < 30)
+            {
+                const std::bitset<kPages> b = Impl::BitsOf(r);
+                for (auto &q : m->planes)
+                    if (q->anyDirty() && (q->dirty & b).any())
+                    {
+                        std::fprintf(stderr, "[gsmtl-dbg] clut hit: cbp=%u cpsm=%u csm=%u cld=%u psm=%u csa=%u pages=%u first=%u | plane %s base=%u fbw=%u h=%u dirty bbox %d,%d..%d,%d\n", tex0.cbp, tex0.cpsm, tex0.csm,
+                                     tex0.cld, tex0.psm, tex0.csa, r.count, r.count ? r.pages[0] : 0u, q->depth ? "z" : "c", q->base, q->fbw, q->height, q->dx0, q->dy0, q->dx1, q->dy1);
+                        ++shown;
+                    }
+                std::fflush(stderr);
+            }
+        }
+        m->CpuRead(r, kFlushClut);
     }
     m->cpu->LoadClut(tex0, texclut);
 }
@@ -2183,12 +2510,12 @@ void GSMetalBackend::BeginTransfer(const GSTransferCommand &command)
     if ((command.direction == 0u || command.direction == 2u) && rect)
         pagesOfRect(b.dbp, b.dbw, b.dpsm, command.trxpos.dsax, command.trxpos.dsay, command.trxpos.dsax + command.trxreg.rrw - 1u,
                     command.trxpos.dsay + command.trxreg.rrh - 1u, dst);
-    if (m->run)
+    if (m->run || m->anyDirtyPlane)
     {
-        m->FlushIfOverlaps(src, kFlushTransfer);
-        m->FlushIfOverlaps(dst, kFlushTransfer);
-        if (command.direction == 3u || command.direction > 2u)
-            m->FlushRun(kFlushTransfer);
+        m->CpuRead(src, kFlushTransfer);
+        m->CpuWrite(dst, kFlushTransfer);
+        if (command.direction > 2u)
+            m->ResolveAll(kFlushTransfer);
     }
     m->cpu->BeginTransfer(command);
     m->transfer = command;
@@ -2204,8 +2531,8 @@ void GSMetalBackend::BeginTransfer(const GSTransferCommand &command)
 
 void GSMetalBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (m->run)
-        m->FlushIfOverlaps(m->transferPages, kFlushTransfer);
+    if (m->run || m->anyDirtyPlane)
+        m->CpuWrite(m->transferPages, kFlushTransfer);
     m->cpu->UploadImage(data, sizeBytes);
     if (m->transferPages.count >= 512u)
         m->MarkAll();
@@ -2215,24 +2542,27 @@ void GSMetalBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 
 void GSMetalBackend::Flush()
 {
-    m->FlushRun();
+    m->CloseRun(kFlushOther);
 }
 
 void GSMetalBackend::TextureFlush()
 {
-    m->FlushRun();
+    // Texture reads validate against page epochs (and GPU-newer pages resolve on demand): nothing to do.
     m->cpu->TextureFlush();
 }
 
 void GSMetalBackend::Sync(GSSyncReason reason)
 {
-    m->FlushRun();
+    // Presentation/Finish: the present itself resolves what the display needs.
+    if (reason != GSSyncReason::Presentation && reason != GSSyncReason::Finish)
+        m->ResolveAll(kFlushReadback);
     m->cpu->Sync(reason);
 }
 
 PresentationFrame GSMetalBackend::Present(const GSPresentationRequest &request)
 {
-    m->FlushRun(kFlushPresent);
+    // The display reads the shadow: write the colour planes back once (depth stays on the GPU).
+    m->ResolvePlanes(nullptr, true, nullptr, nullptr, kFlushPresent);
     ++m->frame.presents;
     static const uint32_t s_statsEvery = std::getenv("PS2X_GS_METAL_STATS") ? uint32_t(std::max(1, std::atoi(std::getenv("PS2X_GS_METAL_STATS")))) : 0u;
     if (s_statsEvery && m->frame.presents % s_statsEvery == 0u)
@@ -2246,7 +2576,7 @@ PresentationFrame GSMetalBackend::Present(const GSPresentationRequest &request)
 
 bool GSMetalBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
-    m->FlushRun();
+    m->ResolveAll(kFlushOther);
     const bool r = m->cpu->ClearFramebuffer(context, rgba);
     m->MarkAll();
     return r;
@@ -2254,49 +2584,50 @@ bool GSMetalBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 
 uint32_t GSMetalBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
-    m->FlushRun(kFlushReadback);
+    m->ResolveAll(kFlushReadback);
     return m->cpu->ConsumeLocalToHostBytes(dst, maxBytes);
 }
 
 uint32_t GSMetalBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
-    m->FlushRun(kFlushReadback);
+    m->ResolveAll(kFlushReadback);
     return m->cpu->ReadVram(psm, base, bw, x, y);
 }
 
 void GSMetalBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
-    m->FlushRun();
+    m->ResolveAll(kFlushOther);
     m->cpu->WriteVram(psm, base, bw, x, y, value);
     m->MarkAll();
 }
 
 void GSMetalBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
-    m->FlushRun(kFlushReadback);
+    m->ResolveAll(kFlushReadback);
     m->cpu->SnapshotVram(out);
 }
 
 GSTransferSnapshot GSMetalBackend::GetTransferSnapshot() const
 {
-    m->FlushRun(kFlushReadback);
+    m->ResolveAll(kFlushReadback);
     return m->cpu->GetTransferSnapshot();
 }
 
 void GSMetalBackend::SetRunObserver(std::function<void(const RunInfo &)> observer)
 {
     m->observer = std::move(observer);
+    m->eager = m->flushAll || static_cast<bool>(m->observer);
 }
 
 void GSMetalBackend::MarkShadowChanged()
 {
-    m->FlushRun();
+    m->ResolveAll(kFlushOther);
     m->MarkAll();
 }
 
 void GSMetalBackend::FlushRun()
 {
-    m->FlushRun();
+    m->Drain(kFlushOther);
 }
 
 GSMetalBackend::Stats GSMetalBackend::TakeFrameStats()

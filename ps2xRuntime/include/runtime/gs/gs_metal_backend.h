@@ -45,7 +45,9 @@ public:
         kFlushFallback,   // per-draw CPU fallback
         kFlushPresent,
         kFlushReadback,   // Read/Snapshot/GetTransferSnapshot/ConsumeLocalToHost
-        kFlushOther,      // Initialize/Reset/Flush/Sync/TextureFlush/Clear/WriteVram/limits
+        kFlushOther,      // Initialize/Reset/Flush/Sync/Clear/WriteVram
+        kFlushPalette,    // palette ring full
+        kFlushLimit,      // prim / in-flight byte limits
         kFlushWhyCount
     };
 
@@ -63,7 +65,9 @@ public:
         uint64_t gpuWaitNs = 0;
         uint64_t presents = 0;
         uint64_t texDecodes = 0, texHits = 0, texTexels = 0, palettes = 0, paletteHits = 0;
-        uint64_t flushes[kFlushWhyCount] = {};
+        uint64_t flushes[kFlushWhyCount] = {}; // runs encoded, by why
+        uint64_t waits[kFlushWhyCount] = {};   // GPU round trips (commit + wait), by why
+        uint64_t commits = 0, partialUploads = 0, uploadPixels = 0;
         // PS2X_GS_METAL_TIMING=1: where the GS thread spends its time (ns)
         uint64_t recordNs = 0, texNs = 0, uploadNs = 0, encodeNs = 0, writebackNs = 0, fallbackNs = 0;
         std::map<std::string, uint64_t> fallbacks; // reason -> primitives
