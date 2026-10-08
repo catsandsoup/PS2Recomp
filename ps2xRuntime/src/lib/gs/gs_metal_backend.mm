@@ -33,6 +33,8 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <string>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -428,6 +430,22 @@ inline uint bilinear8(uint c00, uint c10, uint c01, uint c11, float fx, float fy
         out |= uint(clamp(i, 0, 255)) << sh;
     }
     return out;
+}
+
+// ---------------------------------------------------------------- write-back scatter (G2d)
+// Copies a rectangle of a plane (raw 32-bit VRAM words) straight into the swizzled CPU shadow:
+// exactly GSMem::SwizzledSurface<C32|Z24>::Locate for a page-aligned base (page, page table, 4 MiB wrap).
+struct WbParams { uint x0, y0, w, h, basePage, pagesPerRow; };
+kernel void wb_scatter(texture2d<uint, access::read> src [[texture(0)]], device uint *vram [[buffer(0)]],
+                       const device ushort *tbl [[buffer(1)]], constant WbParams &p [[buffer(2)]],
+                       uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p.w || gid.y >= p.h)
+        return;
+    const uint x = p.x0 + gid.x, y = p.y0 + gid.y;
+    const uint page = p.basePage + (y >> 5) * p.pagesPerRow + (x >> 6);
+    const uint pixel = page * 2048u + uint(tbl[(y & 31u) * 64u + (x & 63u)]);
+    vram[pixel & 0xFFFFFu] = src.read(uint2(x, y)).r;
 }
 
 // ---------------------------------------------------------------- self-test kernels
@@ -881,6 +899,41 @@ struct GSMetalBackend::Impl
     id<MTLComputePipelineState> selftestF = nil;
     id<MTLComputePipelineState> selftestZ = nil;
     id<MTLComputePipelineState> selftestT = nil;
+    id<MTLLibrary> lib = nil;
+    // G2d: GPU write-back straight into the shadow (no CPU swizzle). PS2X_GS_METAL_CPU_WRITEBACK=1 forces the CPU loop.
+    id<MTLComputePipelineState> wbScatter = nil;
+    id<MTLBuffer> shadowBuf = nil; // no-copy alias of the page-rounded shadow range
+    size_t shadowOff = 0;          // offset of vram[0] inside shadowBuf
+    id<MTLBuffer> tblC32 = nil, tblZ24 = nil;
+    bool cpuWriteback = false;
+
+    void EnsureSelftestPipelines()
+    {
+        NSError *err = nil;
+        if (!selftestF)
+            selftestF = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"selftest_f"] error:&err];
+        if (!selftestZ)
+            selftestZ = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"selftest_z"] error:&err];
+        if (!selftestT)
+            selftestT = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"selftest_t"] error:&err];
+    }
+
+    void BindShadow()
+    {
+        shadowBuf = nil;
+        shadowOff = 0;
+        if (cpuWriteback || !wbScatter || !vram || vramSize != 4u * 1024u * 1024u)
+            return;
+        const uintptr_t pg = uintptr_t(getpagesize());
+        const uintptr_t a = reinterpret_cast<uintptr_t>(vram);
+        const uintptr_t lo = a & ~(pg - 1u), hi = (a + vramSize + pg - 1u) & ~(pg - 1u);
+        shadowBuf = [device newBufferWithBytesNoCopy:reinterpret_cast<void *>(lo) length:size_t(hi - lo)
+                                             options:MTLResourceStorageModeShared deallocator:nil];
+        if (shadowBuf)
+            shadowOff = size_t(a - lo);
+        else
+            std::fprintf(stderr, "[gsmtl] shadow alias failed: CPU write-back\n");
+    }
 
     std::unique_ptr<GSCpuBackend> cpu;
     uint8_t *vram = nullptr;
@@ -1286,15 +1339,39 @@ struct GSMetalBackend::Impl
             for (Plane *p : L)
                 EncodeRefill(*p);
             id<MTLCommandBuffer> cmd = GetCmd();
-            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-            for (Plane *p : L)
+            if (shadowBuf)
             {
-                const uint32_t w = uint32_t(p->dx1 - p->dx0 + 1), h = uint32_t(p->dy1 - p->dy0 + 1);
-                [blit copyFromTexture:p->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(p->dx0, p->dy0, 0)
-                           sourceSize:MTLSizeMake(w, h, 1) toBuffer:p->wb destinationOffset:0
-                  destinationBytesPerRow:w * 4u destinationBytesPerImage:size_t(w) * h * 4u];
+                // Planes may share pages: barriers keep the list order of the CPU loop.
+                id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                [ce setComputePipelineState:wbScatter];
+                [ce setBuffer:shadowBuf offset:shadowOff atIndex:0];
+                bool first = true;
+                for (Plane *p : L)
+                {
+                    if (!first)
+                        [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    first = false;
+                    const uint32_t w = uint32_t(p->dx1 - p->dx0 + 1), h = uint32_t(p->dy1 - p->dy0 + 1);
+                    const uint32_t prm[6] = {uint32_t(p->dx0), uint32_t(p->dy0), w, h, p->base, p->fbw};
+                    [ce setTexture:p->tex atIndex:0];
+                    [ce setBuffer:(p->depth ? tblZ24 : tblC32) offset:0 atIndex:1];
+                    [ce setBytes:prm length:sizeof(prm) atIndex:2];
+                    [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+                }
+                [ce endEncoding];
             }
-            [blit endEncoding];
+            else
+            {
+                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                for (Plane *p : L)
+                {
+                    const uint32_t w = uint32_t(p->dx1 - p->dx0 + 1), h = uint32_t(p->dy1 - p->dy0 + 1);
+                    [blit copyFromTexture:p->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(p->dx0, p->dy0, 0)
+                               sourceSize:MTLSizeMake(w, h, 1) toBuffer:p->wb destinationOffset:0
+                      destinationBytesPerRow:w * 4u destinationBytesPerImage:size_t(w) * h * 4u];
+                }
+                [blit endEncoding];
+            }
             CommitCur();
             WaitAll(why);
         }
@@ -1303,7 +1380,11 @@ struct GSMetalBackend::Impl
             const uint64_t tw0 = timing ? nowNs() : 0;
             const uint32_t w = uint32_t(p->dx1 - p->dx0 + 1), h = uint32_t(p->dy1 - p->dy0 + 1);
             const uint32_t *src = static_cast<const uint32_t *>(p->wb.contents);
-            if (p->depth)
+            if (shadowBuf)
+            {
+                // already scattered into the shadow by the GPU
+            }
+            else if (p->depth)
             {
                 const GSMem::SwizzledSurface<GSMem::Z24> zs(p->base << 5, p->fbw);
                 for (uint32_t y = 0; y < h; ++y)
@@ -2306,7 +2387,12 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
 #pragma clang diagnostic pop
         }
         NSError *err = nil;
-        id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource] options:opts error:&err];
+        std::string src = kShaderSource;
+        if (const char *nonce = std::getenv("PS2X_GS_METAL_SHADER_NONCE")) // forces a cold compile (measurement)
+            src += std::string("\n// nonce ") + nonce + "\n";
+        const auto tc0 = std::chrono::steady_clock::now();
+        id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()] options:opts error:&err];
+        const auto tc1 = std::chrono::steady_clock::now();
         if (!lib)
         {
             std::fprintf(stderr, "[gsmtl] shader compile failed: %s\n", err.localizedDescription.UTF8String);
@@ -2317,7 +2403,68 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
         pd.fragmentFunction = [lib newFunctionWithName:@"fs_main"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Uint;
         pd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
-        id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+        MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
+        cd.computeFunction = [lib newFunctionWithName:@"wb_scatter"];
+        // Pipeline cache (G2d): a binary archive of our own pipelines in ~/Library/Caches/RoadTripAdventure, keyed by
+        // the shader source and the GPU, so the backend compile of the pipelines happens once per machine.
+        id<MTLBinaryArchive> archive = nil;
+        NSURL *archiveUrl = nil;
+        const char *pc = std::getenv("PS2X_GS_METAL_PIPELINE_CACHE");
+        const char *home = std::getenv("HOME");
+        if (home && !(pc && std::strcmp(pc, "0") == 0))
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (const char *c : {src.c_str(), device.name.UTF8String})
+                for (; *c; ++c)
+                    h = (h ^ uint8_t(*c)) * 1099511628211ull;
+            char name[64];
+            std::snprintf(name, sizeof(name), "gsmtl_pipelines_%016llx.metalar", (unsigned long long)h);
+            NSString *dir = [NSString stringWithFormat:@"%s/Library/Caches/RoadTripAdventure", home];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            archiveUrl = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]]];
+            MTLBinaryArchiveDescriptor *ad = [MTLBinaryArchiveDescriptor new];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:archiveUrl.path])
+                ad.url = archiveUrl;
+            archive = [device newBinaryArchiveWithDescriptor:ad error:&err];
+            if (!archive && ad.url)
+            {
+                ad.url = nil; // unreadable archive: start a fresh one
+                archive = [device newBinaryArchiveWithDescriptor:ad error:&err];
+            }
+        }
+        bool archiveHit = false;
+        id<MTLRenderPipelineState> pso = nil;
+        id<MTLComputePipelineState> wbs = nil;
+        if (archive)
+        {
+            pd.binaryArchives = @[ archive ];
+            cd.binaryArchives = @[ archive ];
+            pso = [device newRenderPipelineStateWithDescriptor:pd options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&err];
+            wbs = [device newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&err];
+            archiveHit = pso && wbs;
+        }
+        if (!pso)
+            pso = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!wbs)
+            wbs = [device newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionNone reflection:nil error:&err];
+        const auto tc2 = std::chrono::steady_clock::now();
+        if (archive && !archiveHit && pso && wbs)
+        {
+            NSError *aerr = nil;
+            if ([archive addRenderPipelineFunctionsWithDescriptor:pd error:&aerr] &&
+                [archive addComputePipelineFunctionsWithDescriptor:cd error:&aerr])
+            {
+                // temp + rename: concurrent runs never see a half-written archive
+                NSURL *tmp = [NSURL fileURLWithPath:[archiveUrl.path stringByAppendingFormat:@".tmp%d", int(getpid())]];
+                if ([archive serializeToURL:tmp error:&aerr])
+                    std::rename(tmp.path.UTF8String, archiveUrl.path.UTF8String);
+                else
+                    std::remove(tmp.path.UTF8String);
+            }
+        }
+        const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::fprintf(stderr, "[gsmtl] shaders: library %.1f ms, pipelines %.1f ms (archive %s)\n", ms(tc0, tc1), ms(tc1, tc2),
+                     archive ? (archiveHit ? "hit" : "miss, saved") : "off");
         if (!pso)
         {
             std::fprintf(stderr, "[gsmtl] pipeline failed: %s\n", err.localizedDescription.UTF8String);
@@ -2327,10 +2474,24 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
         b->m->device = device;
         b->m->queue = [device newCommandQueue];
         b->m->pipeline = pso;
-        b->m->selftestF = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"selftest_f"] error:&err];
-        b->m->selftestZ = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"selftest_z"] error:&err];
-        b->m->selftestT = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"selftest_t"] error:&err];
+        b->m->lib = lib; // self-test pipelines are created on first use
+        b->m->wbScatter = wbs;
+        b->m->cpuWriteback = std::getenv("PS2X_GS_METAL_CPU_WRITEBACK") != nullptr;
         b->m->cpu = std::make_unique<GSCpuBackend>();
+        // page tables (filled by the GSCpuBackend constructor above) for the write-back scatter
+        {
+            std::vector<uint16_t> tc(64u * 32u), tz(64u * 32u);
+            const auto &c32 = GSMem::PageTable<GSMem::C32>()[0];
+            const auto &z24 = GSMem::PageTable<GSMem::Z24>()[0];
+            for (uint32_t y = 0; y < 32u; ++y)
+                for (uint32_t x = 0; x < 64u; ++x)
+                {
+                    tc[y * 64u + x] = uint16_t(c32[y][x]);
+                    tz[y * 64u + x] = uint16_t(z24[y][x]);
+                }
+            b->m->tblC32 = [device newBufferWithBytes:tc.data() length:tc.size() * 2u options:MTLResourceStorageModeShared];
+            b->m->tblZ24 = [device newBufferWithBytes:tz.data() length:tz.size() * 2u options:MTLResourceStorageModeShared];
+        }
         b->m->timing = std::getenv("PS2X_GS_METAL_TIMING") != nullptr;
         b->m->flushAll = std::getenv("PS2X_GS_METAL_FLUSH_ALL") != nullptr;
         b->m->eager = b->m->flushAll;
@@ -2354,6 +2515,7 @@ void GSMetalBackend::Initialize(uint8_t *vram, uint32_t vramSize)
     m->ResolveAll(kFlushOther);
     m->vram = vram;
     m->vramSize = vramSize;
+    m->BindShadow();
     m->cpu->Initialize(vram, vramSize);
     m->MarkAll();
 }
@@ -2727,6 +2889,7 @@ uint64_t GSMetalBackend::SelfTest(uint32_t cases)
             id<MTLBuffer> bw = [m->device newBufferWithBytes:win.data() length:win.size() * 4u options:MTLResourceStorageModeShared];
             id<MTLBuffer> bzo = [m->device newBufferWithLength:size_t(cases) * 4u options:MTLResourceStorageModeShared];
             id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
+            m->EnsureSelftestPipelines();
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             [enc setComputePipelineState:m->selftestF];
             [enc setBuffer:bin offset:0 atIndex:0];
