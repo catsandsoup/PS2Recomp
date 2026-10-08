@@ -398,6 +398,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_recomp.cpp
     src/lib/games_database.cpp
     src/lib/ps2_call_trace.cpp
+    src/lib/ps2_disc_setup.cpp
 )
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -462,6 +463,10 @@ if(APPLE)
         )
         FetchContent_MakeAvailable(SDL3)
         target_sources(ps2_runtime PRIVATE src/lib/ps2_shell_sdl3.mm)
+        # PK1: first-run disc picker (child process; AppKit only)
+        target_sources(ps2_runtime PRIVATE src/lib/ps2_disc_picker_mac.mm)
+        set_source_files_properties(src/lib/ps2_disc_picker_mac.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+        target_link_libraries(ps2_runtime PUBLIC "-framework UniformTypeIdentifiers")
         set_source_files_properties(src/lib/ps2_shell_sdl3.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
             INCLUDE_DIRECTORIES "$<TARGET_PROPERTY:SDL3::SDL3-static,INTERFACE_INCLUDE_DIRECTORIES>")
         target_link_libraries(ps2_runtime PRIVATE $<LINK_ONLY:SDL3::SDL3-static>)

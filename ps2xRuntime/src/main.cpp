@@ -1,5 +1,6 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
+#include "ps2_disc_setup.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
 #endif
@@ -14,6 +15,7 @@
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -142,11 +144,22 @@ namespace
 
     std::filesystem::path getExecutablePath(int argc, char *argv[])
     {
-        if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+        // "-psn_..." is a process serial number some macOS launch paths still append; not a boot path.
+        if (argc >= 2 && argv[1] && argv[1][0] != '\0' && std::strncmp(argv[1], "-psn_", 5) != 0)
         {
             std::cout << "Using argv boot path" << std::endl;
             return std::filesystem::path(argv[1]);
         }
+#if defined(__APPLE__) && !defined(__ANDROID__)
+        // PK1 (packaged app): no ELF argument -> the user's own disc (PS2X_CD_IMAGE, general.json, or the
+        // first-run picker), extracted once into the config dir.
+        {
+            std::string elf;
+            if (!ps2x::disc::resolveLaunch(elf))
+                throw std::runtime_error("No usable Road Trip Adventure disc (SLES-51356) was configured.");
+            return std::filesystem::path(elf);
+        }
+#endif
 #if defined(PS2X_DEFAULT_BOOT_ELF)
         std::cout << "Using default boot file" << std::endl;
         const std::filesystem::path configuredPath = std::filesystem::path(PS2X_DEFAULT_BOOT_ELF);
@@ -170,6 +183,14 @@ int main(int argc, char *argv[])
     redirectStdioToLogcat();
 #endif
     setupTerminateLogger();
+
+#if defined(__APPLE__) && !defined(__ANDROID__)
+    if (argc >= 2 && argv[1] && std::strcmp(argv[1], ps2x::disc::kPickerArg) == 0)
+        return ps2x::disc::runPickerProcess(argc, argv);
+    // PK1: inside a .app bundle the native SDL3 shell is the default (an explicit PS2X_SHELL still wins).
+    if (ps2x::disc::runningFromAppBundle())
+        ::setenv("PS2X_SHELL", "sdl3", 0);
+#endif
 
     try
     {
