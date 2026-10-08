@@ -2720,10 +2720,12 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 }
 
 void ps2InstallCallTraces(PS2Runtime &runtime);
+namespace ps2x::hooks { void installAll(PS2Runtime &runtime); } // game_hooks.h
 
 void PS2Runtime::run()
 {
     ps2InstallCallTraces(*this);
+    ps2x::hooks::installAll(*this);
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();

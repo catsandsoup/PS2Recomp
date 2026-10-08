@@ -473,6 +473,13 @@ namespace ps2_stubs
                     mode = "r+b";
                 }
             }
+            else if (!read && create)
+            {
+                // Q5b: the game opens its save files with flags 0x200 (O_CREAT, no access bits) and then
+                // writes, as mcman allows. "rb" failed on a missing file ("Save failed" on every first save)
+                // and would make writes to an existing file fail. No truncation without O_TRUNC.
+                mode = exists ? "r+b" : "w+b";
+            }
 
             return std::fopen(hostPath.string().c_str(), mode);
         }
@@ -1040,6 +1047,7 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdOpen, result);
         }
+        RUNTIME_LOG("[MC] Open port=" << port << " slot=" << slot << " '" << path << "' flags=0x" << std::hex << flags << std::dec << " -> " << result);
         setReturnS32(ctx, 0);
     }
 

@@ -11,6 +11,7 @@
 //    Aspect 4:3/Stretch), Window. Choices persist in ~/Library/Application Support/RoadTripAdventure/graphics.json.
 // Compiled as Objective-C++ with ARC. Must not include raylib.h (its names clash with Cocoa).
 #include "ps2_shell.h"
+#include "starter_car.h"
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
@@ -336,6 +337,19 @@ fragment float4 fs_blit(VO in [[stage_in]], texture2d<float> t [[texture(0)]], s
     saveConfig();
     updateMenuState();
 }
+// Game > Starting Car / Starting Colour (GOALS Q5; general.json via starter_car.cpp).
+- (void)setStarterBody:(NSMenuItem *)sender
+{
+    ps2x::starter::selectBody(ps2x::starter::optionBody(int(sender.tag)));
+    for (NSMenuItem *it in sender.menu.itemArray)
+        it.state = it == sender ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)setStarterPaint:(NSMenuItem *)sender
+{
+    ps2x::starter::selectPaint(ps2x::starter::paintOptionWord(int(sender.tag)));
+    for (NSMenuItem *it in sender.menu.itemArray)
+        it.state = it == sender ? NSControlStateValueOn : NSControlStateValueOff;
+}
 @end
 
 namespace
@@ -396,6 +410,25 @@ namespace
         g_fullItem = addItem(view, @"Full Screen", @selector(toggleFull:), @"f", g_menuTarget);
         viewItem.submenu = view;
         [bar addItem:viewItem];
+
+        NSMenuItem *gameItem = [[NSMenuItem alloc] initWithTitle:@"Game" action:nil keyEquivalent:@""];
+        NSMenu *game = [[NSMenu alloc] initWithTitle:@"Game"];
+        NSMenuItem *carItem = [[NSMenuItem alloc] initWithTitle:@"Starting Car (new Adventure)" action:nil keyEquivalent:@""];
+        NSMenu *car = [[NSMenu alloc] initWithTitle:@"Starting Car (new Adventure)"];
+        for (int i = 0; i < ps2x::starter::optionCount(); ++i)
+            addItem(car, [NSString stringWithUTF8String:ps2x::starter::optionLabel(i).c_str()], @selector(setStarterBody:), nil, g_menuTarget, i)
+                .state = ps2x::starter::optionBody(i) == ps2x::starter::selectedBody() ? NSControlStateValueOn : NSControlStateValueOff;
+        carItem.submenu = car;
+        [game addItem:carItem];
+        NSMenuItem *paintItem = [[NSMenuItem alloc] initWithTitle:@"Starting Colour (new Adventure)" action:nil keyEquivalent:@""];
+        NSMenu *paint = [[NSMenu alloc] initWithTitle:@"Starting Colour (new Adventure)"];
+        for (int i = 0; i < ps2x::starter::paintOptionCount(); ++i)
+            addItem(paint, [NSString stringWithUTF8String:ps2x::starter::paintOptionLabel(i)], @selector(setStarterPaint:), nil, g_menuTarget, i)
+                .state = ps2x::starter::paintOptionWord(i) == ps2x::starter::selectedPaint() ? NSControlStateValueOn : NSControlStateValueOff;
+        paintItem.submenu = paint;
+        [game addItem:paintItem];
+        gameItem.submenu = game;
+        [bar addItem:gameItem];
 
         NSMenuItem *winItem = [[NSMenuItem alloc] initWithTitle:@"Window" action:nil keyEquivalent:@""];
         NSMenu *win = [[NSMenu alloc] initWithTitle:@"Window"];
