@@ -32,6 +32,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <random>
 #include <string>
@@ -959,6 +960,44 @@ bool GSMetalCopyHiresFrame(std::vector<uint8_t> &px, uint32_t &w, uint32_t &h, u
     return true;
 }
 
+// SH1 (M4): direct GPU present of the scaled frame into the sdl3 shell's CAMetalLayer. With the flag on
+// (sdl3 window, no PS2X_DUMP_FRAMES_HIRES), BuildHiFrame encodes hi_present into a texture ring and
+// commits without a GPU wait or CPU readback; the shell draws the texture on the same command queue.
+namespace
+{
+    struct DirectHi
+    {
+        id<MTLTexture> tex = nil;
+        uint32_t w = 0, h = 0;
+        uint64_t key = 0, serial = 0;
+    };
+    std::mutex g_directMu;
+    DirectHi g_directRing[3];
+    uint64_t g_directSerial = 0;
+    std::atomic<bool> g_directOn{false};
+    std::atomic<bool> g_hiActive{false};
+    id<MTLCommandQueue> g_sharedQueue = nil;
+}
+
+void GSMetalSetDirectHi(bool on) { g_directOn.store(on, std::memory_order_release); }
+id<MTLCommandQueue> GSMetalSharedQueue() { return g_sharedQueue; }
+bool GSMetalDirectHiOn() { return g_directOn.load(std::memory_order_acquire) && g_hiActive.load(std::memory_order_acquire); }
+
+// key != 0: the texture whose 1x frame hashed to key (nil when none).
+id<MTLTexture> GSMetalDirectHiTexture(uint64_t key, uint32_t &w, uint32_t &h)
+{
+    std::lock_guard<std::mutex> lk(g_directMu);
+    const DirectHi *best = nullptr;
+    for (const DirectHi &e : g_directRing)
+        if (e.tex && e.key == key && (!best || e.serial > best->serial))
+            best = &e;
+    if (!best)
+        return nil;
+    w = best->w;
+    h = best->h;
+    return best->tex;
+}
+
 struct GSMetalBackend::Impl
 {
     // One 32-bit-word VRAM surface kept on the GPU (colour planes use the C32 swizzle, depth planes Z24).
@@ -1051,6 +1090,9 @@ struct GSMetalBackend::Impl
     // G2e: display-only scaled pass (PS2X_GS_SCALE=s: sx = s, sy = 2s with PS2X_GS_PROGRESSIVE, the default for s > 1)
     bool hi = false;
     uint32_t hsx = 1, hsy = 1;
+    id<MTLBuffer> directBuf = nil; // SH1: hi_present output for the direct present (one buffer; same-queue ordering)
+    id<MTLTexture> directTex[3] = {nil, nil, nil};
+    uint32_t directSlot = 0;
     uint32_t hiDbg = std::getenv("PS2X_GS_HI_DEBUG") ? uint32_t(std::atoi(std::getenv("PS2X_GS_HI_DEBUG"))) : 0u;
     id<MTLRenderPipelineState> hiPipeline = nil;
     id<MTLComputePipelineState> hiUpscale = nil, hiPresent = nil;
@@ -1853,7 +1895,7 @@ struct GSMetalBackend::Impl
         lastPmode = req.pmode;
         lastSmode2 = req.smode2;
         const uint32_t outW = f.width * hsx, outH = f.height * hsx;
-        std::vector<uint8_t> px(size_t(outW) * outH * 4u);
+        std::vector<uint8_t> px; // sized only on the CPU-copy paths (the SH1 direct present needs none)
         bool ok = false;
         const uint64_t dfb = (en1 && !en2) ? req.dispfb1 : ((!en1 && en2) ? req.dispfb2 : 0ull);
         const uint32_t dFbp = uint32_t(dfb & 0x1FFu), dFbw = uint32_t((dfb >> 9) & 0x3Fu), dPsm = uint32_t((dfb >> 15) & 0x1Fu);
@@ -1877,6 +1919,55 @@ struct GSMetalBackend::Impl
                     const uint32_t oy = (same ? uint32_t((dfb >> 43) & 0x7FFu) : 0u) * hsy;
                     const uint32_t scan = field ? std::max<uint32_t>(1u, f.height / 2u) : f.height;
                     const uint32_t prm[6] = {ox, oy, outW, outH, scan * hsy, outH};
+                    // PS2X_GS_DIRECT_VERIFY=1 (tests, any shell): also build the direct texture and compare it with the CPU copy.
+                    static const bool s_directVerify = std::getenv("PS2X_GS_DIRECT_VERIFY") != nullptr;
+                    id<MTLTexture> verifyTex = nil;
+                    uint64_t verifyKey = 0;
+                    if (g_directOn.load(std::memory_order_acquire) || s_directVerify)
+                    {
+                        // SH1 direct present: GPU only, no wait, no readback, no CPU frame.
+                        const size_t bytes = size_t(outW) * outH * 4u;
+                        if (!directBuf || directBuf.length < bytes)
+                            directBuf = [device newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+                        const uint32_t slot = directSlot++ % 3u;
+                        id<MTLTexture> dt = directTex[slot];
+                        if (!dt || dt.width != outW || dt.height != outH)
+                        {
+                            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                                          width:outW
+                                                                                                         height:outH
+                                                                                                      mipmapped:NO];
+                            td.storageMode = MTLStorageModePrivate;
+                            td.usage = MTLTextureUsageShaderRead;
+                            dt = directTex[slot] = [device newTextureWithDescriptor:td];
+                        }
+                        id<MTLCommandBuffer> cmd = GetCmd();
+                        id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
+                        [ce setComputePipelineState:hiPresent];
+                        [ce setTexture:P->hiTex atIndex:0];
+                        [ce setBuffer:directBuf offset:0 atIndex:0];
+                        [ce setBytes:prm length:sizeof(prm) atIndex:1];
+                        [ce dispatchThreads:MTLSizeMake(outW, outH, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+                        [ce endEncoding];
+                        id<MTLBlitCommandEncoder> be = [cmd blitCommandEncoder];
+                        [be copyFromBuffer:directBuf sourceOffset:0 sourceBytesPerRow:size_t(outW) * 4u sourceBytesPerImage:bytes
+                                sourceSize:MTLSizeMake(outW, outH, 1) toTexture:dt destinationSlice:0 destinationLevel:0
+                         destinationOrigin:MTLOriginMake(0, 0, 0)];
+                        [be endEncoding];
+                        CommitCur();
+                        std::lock_guard<std::mutex> lk(g_directMu);
+                        DirectHi &e = g_directRing[g_directSerial % 3u];
+                        e.tex = dt;
+                        e.w = outW;
+                        e.h = outH;
+                        e.key = GSMetalFrameKey(f.pixels.data(), f.width, f.height, 640u * 4u);
+                        e.serial = ++g_directSerial;
+                        if (!s_directVerify)
+                            return;
+                        verifyTex = dt;
+                        verifyKey = e.key;
+                    }
+                    px.resize(size_t(outW) * outH * 4u);
                     if (!hiOut || hiOut.length < px.size())
                         hiOut = [device newBufferWithLength:px.size() options:MTLResourceStorageModeShared];
                     id<MTLCommandBuffer> cmd = GetCmd();
@@ -1891,12 +1982,37 @@ struct GSMetalBackend::Impl
                     WaitAll(kFlushPresent);
                     std::memcpy(px.data(), hiOut.contents, px.size());
                     ok = true;
+                    if (verifyTex)
+                    {
+                        static uint64_t s_vFrames = 0, s_vBad = 0, s_vLookupBad = 0;
+                        id<MTLBuffer> vb = [device newBufferWithLength:px.size() options:MTLResourceStorageModeShared];
+                        id<MTLCommandBuffer> vc = [queue commandBuffer];
+                        id<MTLBlitCommandEncoder> vbe = [vc blitCommandEncoder];
+                        [vbe copyFromTexture:verifyTex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(outW, outH, 1)
+                                    toBuffer:vb destinationOffset:0 destinationBytesPerRow:size_t(outW) * 4u destinationBytesPerImage:px.size()];
+                        [vbe endEncoding];
+                        [vc commit];
+                        [vc waitUntilCompleted];
+                        ++s_vFrames;
+                        if (std::memcmp(vb.contents, px.data(), px.size()) != 0)
+                            ++s_vBad;
+                        uint32_t lw = 0, lh = 0;
+                        if (GSMetalDirectHiTexture(verifyKey, lw, lh) != verifyTex || lw != outW || lh != outH)
+                            ++s_vLookupBad;
+                        if (s_vFrames % 50u == 1u)
+                        {
+                            std::fprintf(stderr, "[gsmtl-direct] verify frames=%llu mismatched=%llu lookup_bad=%llu size=%ux%u\n", (unsigned long long)s_vFrames,
+                                         (unsigned long long)s_vBad, (unsigned long long)s_vLookupBad, outW, outH);
+                            std::fflush(stderr);
+                        }
+                    }
                 }
             }
         }
         if (!ok)
         {
             ++hiFallbacks;
+            px.resize(size_t(outW) * outH * 4u);
             for (uint32_t y = 0; y < outH; ++y)
                 for (uint32_t x = 0; x < outW; ++x)
                     std::memcpy(&px[(size_t(y) * outW + x) * 4u], &f.pixels[(size_t(y / hsx) * 640u + x / hsx) * 4u], 4);
@@ -2831,6 +2947,7 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
         std::unique_ptr<GSMetalBackend> b(new GSMetalBackend());
         b->m->device = device;
         b->m->queue = [device newCommandQueue];
+        g_sharedQueue = b->m->queue; // SH1: the shell presents direct scaled frames on this queue
         b->m->pipeline = pso;
         b->m->lib = lib; // self-test pipelines are created on first use
         b->m->wbScatter = wbs;
@@ -2854,6 +2971,7 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
                 b->m->hiUpscale = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"hi_upscale"] error:&herr];
                 b->m->hiPresent = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"hi_present"] error:&herr];
                 b->m->hi = b->m->hiPipeline && b->m->hiUpscale && b->m->hiPresent;
+                g_hiActive.store(b->m->hi, std::memory_order_release);
                 std::fprintf(stderr, "[gsmtl-hi] display scale %ux%u %s%s\n", b->m->hsx, b->m->hsy, b->m->hi ? "on" : "FAILED: ",
                              b->m->hi ? "" : (herr ? herr.localizedDescription.UTF8String : "?"));
             }

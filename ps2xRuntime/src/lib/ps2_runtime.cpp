@@ -19,6 +19,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include "ps2_shell.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -658,6 +659,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
+#if defined(__APPLE__)
+    if (ps2x::shell::sdl3Window()) // SH1: the SDL3/Metal shell presents this frame (and the paired scaled one)
+    {
+        const uint64_t hiKey = ps2x::shell::wantsHiKey() && !s_scratch.empty() ? GSMetalFrameKey(s_scratch.data(), width, height, width * 4u) : 0u;
+        ps2x::shell::submitFrame(s_uploadBuffer.data(), FB_WIDTH * 4u, static_cast<uint32_t>(s_uploadBuffer.size() / (FB_WIDTH * 4u)), width, height, hiKey);
+    }
+#endif
     if (tex.id != 0u) // no texture (and no GL context) in PS2X_HEADLESS no-window mode
     {
         UpdateTexture(tex, s_uploadBuffer.data());
@@ -797,6 +805,19 @@ namespace
 
     void startNativeAudioStream()
     {
+        if (ps2x::shell::sdl3Selected())
+        {
+            // SH1: the SDL3 shell owns the audio device (raylib's is never opened in this shell).
+            if (g_nativeAudioStreamLoaded)
+                return;
+            if (const char *off = std::getenv("PS2X_NATIVE_AUDIO"); off && off[0] == '0')
+                return;
+            if (!ps2x::shell::startAudio(nativeAudioCallback, ps2x::iop::kNativeAudioSampleRate, ps2x::iop::kNativeAudioChannels, hostAudioMuted()))
+                return;
+            g_nativeAudioStreamLoaded = true;
+            ps2x::iop::markNativeAudioDeviceActive(true);
+            return;
+        }
         if (g_nativeAudioStreamLoaded || !IsAudioDeviceReady())
             return;
         if (const char *off = std::getenv("PS2X_NATIVE_AUDIO"); off && off[0] == '0')
@@ -816,6 +837,13 @@ namespace
     {
         if (!g_nativeAudioStreamLoaded)
             return;
+        if (ps2x::shell::sdl3Selected())
+        {
+            ps2x::shell::stopAudio();
+            g_nativeAudioStreamLoaded = false;
+            ps2x::iop::markNativeAudioDeviceActive(false);
+            return;
+        }
         StopAudioStream(g_nativeAudioStream);
         UnloadAudioStream(g_nativeAudioStream);
         g_nativeAudioStreamLoaded = false;
@@ -854,6 +882,7 @@ PS2Runtime::~PS2Runtime()
         {
             CloseWindow();
         }
+        ps2x::shell::shutdown();
 
         m_loadedModules.clear();
     }
@@ -1045,6 +1074,24 @@ bool PS2Runtime::initialize(const char *title)
 #else
         // PS2X_HEADLESS=1: hidden window (automated route/trace runs must not pop up over the user's
         // desktop or take focus). Rendering and frame dumps still run.
+        if (ps2x::shell::sdl3Selected())
+        {
+            // SH1 (PS2X_SHELL=sdl3): SDL3 window + CAMetalLayer, SDL3 input and audio. Headless runs
+            // initialise SDL audio only (no NSApp, no window, no gamepads).
+            if (!ps2x::shell::init(title, ps2x::shell::sdl3Window()))
+            {
+                if (ps2x::shell::sdl3Window())
+                {
+                    std::cerr << "Failed to initialize the SDL3 shell" << std::endl;
+                    return false;
+                }
+                std::cerr << "[shell] SDL3 audio unavailable; running without a host audio device" << std::endl;
+            }
+            m_audioBackend.setAudioReady(false); // the legacy raylib Sound path needs raylib's audio device
+            startNativeAudioStream();
+        }
+        else
+        {
         unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
         if (const char *headless = std::getenv("PS2X_HEADLESS"); headless && headless[0] == '1')
             windowFlags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED;
@@ -1058,9 +1105,10 @@ bool PS2Runtime::initialize(const char *title)
             SetMasterVolume(0.0f);
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startNativeAudioStream();
+        }
 #endif
         SetTargetFPS(60);
-        if (m_debugUiInitCallback && !hostNoWindow())
+        if (m_debugUiInitCallback && !hostNoWindow() && !ps2x::shell::sdl3Selected()) // rlImGui needs raylib's GL context
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
@@ -2694,7 +2742,7 @@ void PS2Runtime::run()
 
     // A blank image to use as a framebuffer
     Texture2D frameTex{};
-    if (!hostNoWindow())
+    if (!hostNoWindow() && !ps2x::shell::sdl3Selected())
     {
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
         frameTex = LoadTextureFromImage(blank);
@@ -2796,7 +2844,17 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
-        if (hostNoWindow())
+        if (ps2x::shell::sdl3Window())
+        {
+            // SH1: events + v-synced present into the CAMetalLayer (paces this loop like EndDrawing does).
+            if (!ps2x::shell::pumpAndPresent())
+            {
+                RUNTIME_LOG("[run] window close requested, breaking out of loop");
+                requestStop();
+                break;
+            }
+        }
+        else if (hostNoWindow())
         {
             // Same ~60 Hz host cadence as EndDrawing() + SetTargetFPS(60) gives the windowed loop.
             std::this_thread::sleep_for(std::chrono::microseconds(16667));
@@ -2862,7 +2920,7 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    if (!hostNoWindow())
+    if (!hostNoWindow() && !ps2x::shell::sdl3Selected())
     {
         UnloadTexture(frameTex);
         CloseWindow();

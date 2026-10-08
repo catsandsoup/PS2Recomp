@@ -442,6 +442,31 @@ if(APPLE)
     # compiled by the C++ compiler as Objective-C++ (enabling the OBJCXX language would also reclassify GLFW's .m files)
     set_source_files_properties(src/lib/gs/gs_metal_backend.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
     target_link_libraries(ps2_runtime PUBLIC "-framework Metal" "-framework Foundation")
+
+    # SH1: native macOS shell (PS2X_SHELL=sdl3, opt-in): SDL3 window + CAMetalLayer, gamepads, audio, NSMenu.
+    # SDL3 is built STATIC from a pinned release so the packaged .app needs no Homebrew dylibs. Its include
+    # directory is set on the shell source only, so no other runtime or generated unit changes its flags.
+    if(NOT PS2X_IS_ANDROID)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+        set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            SDL3
+            GIT_REPOSITORY "https://github.com/libsdl-org/SDL.git"
+            GIT_TAG "release-3.2.30"
+            GIT_SHALLOW TRUE
+            GIT_PROGRESS TRUE
+        )
+        FetchContent_MakeAvailable(SDL3)
+        target_sources(ps2_runtime PRIVATE src/lib/ps2_shell_sdl3.mm)
+        set_source_files_properties(src/lib/ps2_shell_sdl3.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
+            INCLUDE_DIRECTORIES "$<TARGET_PROPERTY:SDL3::SDL3-static,INTERFACE_INCLUDE_DIRECTORIES>")
+        target_link_libraries(ps2_runtime PRIVATE $<LINK_ONLY:SDL3::SDL3-static>)
+        target_link_libraries(ps2_runtime PUBLIC "-framework QuartzCore" "-framework AppKit")
+    endif()
 endif()
 
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
