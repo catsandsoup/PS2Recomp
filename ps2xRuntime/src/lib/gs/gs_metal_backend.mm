@@ -32,6 +32,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <unistd.h>
@@ -493,12 +494,14 @@ struct FOut {
 
 inline int pick_blend(uint sel, int cs, int cd) { return sel == 0u ? cs : (sel == 1u ? cd : 0); }
 
-fragment FOut fs_main(VOut in [[stage_in]], const device Prim *prims [[buffer(0)]],
-                      const device uint *pal [[buffer(1)]], texture2d<uint, access::read> tex [[texture(0)]],
-                      uint fb [[color(0)]], uint zb [[color(1)]])
+// G2e: HI = the display-only scaled pass (PS2X_GS_SCALE). HI=false is the exact 1x pass, unchanged.
+struct HiP { float sx, sy; uint isx, isy, dbg; };
+
+template <bool HI>
+inline FOut fs_impl(VOut in, const device Prim *prims, const device uint *pal, texture2d<uint, access::read> tex, uint fb, uint zb, HiP hp)
 {
     const Prim P = prims[in.prim];
-    const bool rtz = (P.flags & 4u) != 0u;
+    const bool rtz = HI ? false : ((P.flags & 4u) != 0u);
     uint r, g, b, a, fog, z;
     float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f;
     if ((P.flags & 1u) != 0u) {
@@ -506,14 +509,23 @@ fragment FOut fs_main(VOut in [[stage_in]], const device Prim *prims [[buffer(0)
         fog = P.fog & 0xFFu;
         z = P.spriteZ;
     } else {
-        const float px = in.pos.x, py = in.pos.y; // pixel centre = integer + 0.5
+        // HI: sub-sample centres, nudged off the 1/16 vertex grid so that samples rarely lie exactly on a shared edge
+        // (the 1x edge tolerance, kept so rounding never opens a seam, would cover them twice)
+        float px = HI ? in.pos.x / hp.sx + 0.0009765625f : in.pos.x, py = HI ? in.pos.y / hp.sy + 0.00048828125f : in.pos.y; // pixel centre = integer + 0.5
+        if (HI && (hp.dbg & 2u) != 0u) { px = floor(px) + 0.5f; py = floor(py) + 0.5f; } // debug: triangles at native centres
         const float dx = f_sub(px, P.fx2, rtz), dy = f_sub(py, P.fy2, rtz);
         w0 = f_mul(f_mul(f_fma(P.a0, dx, f_mul(P.b0, dy, rtz), rtz), P.winding, rtz), P.invAbsDenom, rtz);
         w1 = f_mul(f_mul(f_fma(P.a1, dx, f_mul(P.b1, dy, rtz), rtz), P.winding, rtz), P.invAbsDenom, rtz);
         w2 = f_sub(f_sub(1.0f, w0, rtz), w1, rtz);
         if (w0 < -1.0e-4f || w1 < -1.0e-4f || w2 < -1.0e-4f)
             discard_fragment();
-        z = tri_z(P.z0, P.z1, P.z2, w0, w1, w2, rtz);
+        if (HI) {
+            // display-only Z: exact for constant-Z triangles at any sub-sample (the 1x soft-double sum of
+            // z*w terms rounds to Z-1 at some off-centre samples: coplanar GEQUAL overlays then lose dots)
+            const float d = fma(w0, P.z0 - P.z2, w1 * (P.z1 - P.z2));
+            z = uint(clamp(int(P.z2) + int(rint(d)), 0, 0xFFFFFF));
+        } else
+            z = tri_z(P.z0, P.z1, P.z2, w0, w1, w2, rtz);
         if ((P.flags & 2u) != 0u) {
             r = interp_u8(P.rgba0 & 0xFFu, P.rgba1 & 0xFFu, P.rgba2 & 0xFFu, w0, w1, w2, rtz);
             g = interp_u8((P.rgba0 >> 8) & 0xFFu, (P.rgba1 >> 8) & 0xFFu, (P.rgba2 >> 8) & 0xFFu, w0, w1, w2, rtz);
@@ -535,12 +547,33 @@ fragment FOut fs_main(VOut in [[stage_in]], const device Prim *prims [[buffer(0)
             float cu, cv;
             if ((P.flags & 1u) != 0u) {
                 // Raster::Sprite: per-axis position t = (x - x0 + 0.5) / W, coord = u0 + (u1 - u0) * t
-                const int sx = int(in.pos.x), sy = int(in.pos.y);
-                const float tx = f_div(float(sx - as_type<int>(P.uv0)) + 0.5f, P.q0, rtz);
-                const float ty = f_div(float(sy - as_type<int>(P.uv1)) + 0.5f, P.q1, rtz);
+                float tx, ty;
+                if (!HI) {
+                    const int sx = int(in.pos.x), sy = int(in.pos.y);
+                    tx = f_div(float(sx - as_type<int>(P.uv0)) + 0.5f, P.q0, rtz);
+                    ty = f_div(float(sy - as_type<int>(P.uv1)) + 0.5f, P.q1, rtz);
+                } else {
+                    // sprite policy: a framebuffer source samples the scaled target continuously; a decoded texture is
+                    // sampled native-texel-exact (as 1x) unless the axis is magnified >= 1.25x, then sub-pixel but
+                    // clamped to the 1x first/last pixel so no texel outside what 1x reads can bleed in
+                    float nx = in.pos.x / hp.sx, ny = in.pos.y / hp.sy;
+                    if ((P.tflags & 4096u) == 0u) {
+                        const uint gy = as_type<uint>(P.q2);
+                        const float gx0 = float(P.uv2 & 0xFFFFu) + 0.5f, gx1 = float(P.uv2 >> 16) + 0.5f;
+                        const float gy0 = float(gy & 0xFFFFu) + 0.5f, gy1 = float(gy >> 16) + 0.5f;
+                        const bool mag = (hp.dbg & 1u) == 0u; // debug bit 1: always native-texel-exact
+                        nx = (mag && abs(P.s1 - P.s0) * 1.25f <= P.q0) ? clamp(nx, gx0, gx1) : floor(nx) + 0.5f;
+                        ny = (mag && abs(P.t1 - P.t0) * 1.25f <= P.q1) ? clamp(ny, gy0, gy1) : floor(ny) + 0.5f;
+                    }
+                    tx = (nx - float(as_type<int>(P.uv0))) / P.q0;
+                    ty = (ny - float(as_type<int>(P.uv1))) / P.q1;
+                }
                 const float tu = f_fma(f_sub(P.s1, P.s0, rtz), tx, P.s0, rtz);
                 const float tv = f_fma(f_sub(P.t1, P.t0, rtz), ty, P.t0, rtz);
-                if (fst) {
+                if (HI && (P.tflags & 4096u) != 0u) {
+                    cu = tu;
+                    cv = tv;
+                } else if (fst) {
                     cu = float(clamp(cvt_s32(f_fma(tu, 16.0f, 0.5f, rtz)), 0, 65535)) * 0.0625f;
                     cv = float(clamp(cvt_s32(f_fma(tv, 16.0f, 0.5f, rtz)), 0, 65535)) * 0.0625f;
                 } else {
@@ -562,8 +595,21 @@ fragment FOut fs_main(VOut in [[stage_in]], const device Prim *prims [[buffer(0)
                 cu = tex_coord_stq(is, iq, texW, rtz);
                 cv = tex_coord_stq(it, iq, texH, rtz);
             }
-            const Axis au = prep_axis(cu, texW, wms, P.regU & 0xFFFFu, P.regU >> 16, linear, rtz);
-            const Axis av = prep_axis(cv, texH, wmt, P.regV & 0xFFFFu, P.regV >> 16, linear, rtz);
+            uint sW = texW, sH = texH, mU = wms, mV = wmt;
+            uint rU0 = P.regU & 0xFFFFu, rU1 = P.regU >> 16, rV0 = P.regV & 0xFFFFu, rV1 = P.regV >> 16;
+            if (HI && (P.tflags & 4096u) != 0u) {
+                // the scaled framebuffer target: hi texel = native coordinate * s (the 1x proof rules out wrapping)
+                cu *= hp.sx;
+                cv *= hp.sy;
+                sW = texW * hp.isx;
+                sH = texH * hp.isy;
+                mU = (wms == 2u) ? 2u : 1u;
+                mV = (wmt == 2u) ? 2u : 1u;
+                rU0 *= hp.isx; rU1 = rU1 * hp.isx + hp.isx - 1u;
+                rV0 *= hp.isy; rV1 = rV1 * hp.isy + hp.isy - 1u;
+            }
+            const Axis au = prep_axis(cu, sW, mU, rU0, rU1, linear, rtz);
+            const Axis av = prep_axis(cv, sH, mV, rV0, rV1, linear, rtz);
             uint texel;
             if (!linear) {
                 texel = fetch_texel(tex, pal, P.palOff, P.tflags, P.texa, P.fbw, au.i0, av.i0);
@@ -677,6 +723,45 @@ fragment FOut fs_main(VOut in [[stage_in]], const device Prim *prims [[buffer(0)
     if (wZ && (P.flags & 128u) == 0u)
         o.depth = (zb & 0xFF000000u) | (z & 0x00FFFFFFu);
     return o;
+}
+
+fragment FOut fs_main(VOut in [[stage_in]], const device Prim *prims [[buffer(0)]],
+                      const device uint *pal [[buffer(1)]], texture2d<uint, access::read> tex [[texture(0)]],
+                      uint fb [[color(0)]], uint zb [[color(1)]])
+{
+    HiP one;
+    one.sx = 1.0f; one.sy = 1.0f; one.isx = 1u; one.isy = 1u; one.dbg = 0u;
+    return fs_impl<false>(in, prims, pal, tex, fb, zb, one);
+}
+
+fragment FOut fs_hi(VOut in [[stage_in]], const device Prim *prims [[buffer(0)]],
+                    const device uint *pal [[buffer(1)]], constant HiP &hp [[buffer(2)]], texture2d<uint, access::read> tex [[texture(0)]],
+                    uint fb [[color(0)]], uint zb [[color(1)]])
+{
+    return fs_impl<true>(in, prims, pal, tex, fb, zb, hp);
+}
+
+// G2e: nearest upscale of a native rectangle of a plane into its scaled copy (refills from the shadow)
+kernel void hi_upscale(texture2d<uint, access::read> src [[texture(0)]], texture2d<uint, access::write> dst [[texture(1)]],
+                       constant uint4 &r [[buffer(0)]], constant uint2 &s [[buffer(1)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= r.z * s.x || gid.y >= r.w * s.y)
+        return;
+    const uint2 d = uint2(r.x * s.x + gid.x, r.y * s.y + gid.y);
+    dst.write(src.read(uint2(d.x / s.x, d.y / s.y)), d);
+}
+
+// G2e: the scaled display rectangle -> RGBA8 (p: origin x, y, out w, h, row num, row den)
+kernel void hi_present(texture2d<uint, access::read> src [[texture(0)]], device uint *out [[buffer(0)]],
+                       constant uint *p [[buffer(1)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p[2] || gid.y >= p[3])
+        return;
+    const uint x = p[0] + gid.x, y = p[1] + (gid.y * p[4]) / p[5];
+    uint v = 0u;
+    if (x < src.get_width() && y < src.get_height())
+        v = src.read(uint2(x, y)).x;
+    out[gid.y * p[2] + gid.x] = v | 0xFF000000u;
 }
 )METAL";
 
@@ -820,6 +905,60 @@ void GSMetalPrintStats(const char *tag, const GSMetalBackend::Stats &s)
     std::fflush(stderr);
 }
 
+// G2e: the newest scaled display frame (PS2X_GS_SCALE > 1), for frame dumps and the host window.
+namespace
+{
+    // a short ring keyed by a hash of the 1x frame, so a dump pairs its 1x and scaled frames exactly
+    struct HiFrame
+    {
+        std::vector<uint8_t> px;
+        uint32_t w = 0, h = 0;
+        uint64_t key = 0, serial = 0;
+    };
+    std::mutex g_hiMu;
+    HiFrame g_hiRing[3];
+    uint64_t g_hiSerial = 0;
+}
+
+uint64_t GSMetalFrameKey(const uint8_t *px, uint32_t w, uint32_t h, uint32_t strideBytes)
+{
+    uint64_t k = 1469598103934665603ull ^ (uint64_t(w) << 32) ^ h;
+    for (uint32_t y = 0; y < h; ++y)
+    {
+        const uint64_t *row = reinterpret_cast<const uint64_t *>(px + size_t(y) * strideBytes);
+        for (uint32_t i = 0; i < (w * 4u) / 8u; ++i)
+            k = (k ^ row[i]) * 1099511628211ull;
+    }
+    return k;
+}
+
+void GSMetalPublishHires(std::vector<uint8_t> &&px, uint32_t w, uint32_t h, uint64_t key)
+{
+    std::lock_guard<std::mutex> lk(g_hiMu);
+    HiFrame &e = g_hiRing[g_hiSerial % 3u];
+    e.px = std::move(px);
+    e.w = w;
+    e.h = h;
+    e.key = key;
+    e.serial = ++g_hiSerial;
+}
+
+// key != 0: the frame whose 1x frame hashed to key (false when none); key == 0: the newest.
+bool GSMetalCopyHiresFrame(std::vector<uint8_t> &px, uint32_t &w, uint32_t &h, uint64_t key)
+{
+    std::lock_guard<std::mutex> lk(g_hiMu);
+    const HiFrame *best = nullptr;
+    for (const HiFrame &e : g_hiRing)
+        if (!e.px.empty() && (key == 0u ? (!best || e.serial > best->serial) : (e.key == key && (!best || e.serial > best->serial))))
+            best = &e;
+    if (!best)
+        return false;
+    px = best->px;
+    w = best->w;
+    h = best->h;
+    return true;
+}
+
 struct GSMetalBackend::Impl
 {
     // One 32-bit-word VRAM surface kept on the GPU (colour planes use the C32 swizzle, depth planes Z24).
@@ -838,6 +977,8 @@ struct GSMetalBackend::Impl
         int lpx0 = 1, lpy0 = 1, lpx1 = 0, lpy1 = 0; // last marked page rectangle (fast path)
         uint64_t syncEpoch = 0;
         bool valid = false;
+        id<MTLTexture> hiTex = nil; // G2e display-only scaled copy (mirrors every write to tex)
+        bool hiValid = false;
         bool anyDirty() const { return dx1 >= dx0; }
     };
 
@@ -891,6 +1032,7 @@ struct GSMetalBackend::Impl
     {
         uint32_t first = 0;
         id<MTLTexture> tex = nil;
+        id<MTLTexture> hiTex = nil; // scaled-pass binding when it differs (framebuffer sources)
     };
 
     id<MTLDevice> device = nil;
@@ -906,6 +1048,18 @@ struct GSMetalBackend::Impl
     size_t shadowOff = 0;          // offset of vram[0] inside shadowBuf
     id<MTLBuffer> tblC32 = nil, tblZ24 = nil;
     bool cpuWriteback = false;
+    // G2e: display-only scaled pass (PS2X_GS_SCALE=s: sx = s, sy = 2s with PS2X_GS_PROGRESSIVE, the default for s > 1)
+    bool hi = false;
+    uint32_t hsx = 1, hsy = 1;
+    uint32_t hiDbg = std::getenv("PS2X_GS_HI_DEBUG") ? uint32_t(std::atoi(std::getenv("PS2X_GS_HI_DEBUG"))) : 0u;
+    id<MTLRenderPipelineState> hiPipeline = nil;
+    id<MTLComputePipelineState> hiUpscale = nil, hiPresent = nil;
+    id<MTLTexture> snapHi = nil, primTexHi = nil;
+    id<MTLBuffer> hiOut = nil;
+    uint64_t hiUpscalePx = 0, hiPresents = 0, hiFallbacks = 0, hiPasses = 0;
+    double gpuBusyS = 0.0;
+    uint64_t lastPmode = ~0ull, lastSmode2 = ~0ull;
+    uint32_t modeLogs = 0;
 
     void EnsureSelftestPipelines()
     {
@@ -1036,6 +1190,27 @@ struct GSMetalBackend::Impl
         d.storageMode = MTLStorageModePrivate;
         p.tex = [device newTextureWithDescriptor:d];
         p.wb = [device newBufferWithLength:size_t(p.width) * p.height * 4u options:MTLResourceStorageModeShared];
+        p.hiTex = nil;
+        p.hiValid = false;
+        if (hi)
+        {
+            if (p.width * hsx > 16384u || p.height * hsy > 16384u)
+            {
+                std::fprintf(stderr, "[gsmtl-hi] plane %ux%u too large at %ux%u: scaled pass off\n", p.width, p.height, hsx, hsy);
+                std::fflush(stderr);
+                hi = false;
+            }
+            else
+            {
+                MTLTextureDescriptor *hd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+                                                                                              width:p.width * hsx
+                                                                                             height:p.height * hsy
+                                                                                          mipmapped:NO];
+                hd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+                hd.storageMode = MTLStorageModePrivate;
+                p.hiTex = [device newTextureWithDescriptor:hd];
+            }
+        }
         p.valid = false;
         p.syncEpoch = 0;
         p.dirty.reset();
@@ -1184,6 +1359,7 @@ struct GSMetalBackend::Impl
             for (id<MTLCommandBuffer> c : inflightCmds)
             {
                 [c waitUntilCompleted];
+                gpuBusyS += c.GPUEndTime - c.GPUStartTime;
                 if (c.status == MTLCommandBufferStatusError)
                 {
                     std::fprintf(stderr, "[gsmtl] command buffer error: %s\n", c.error.localizedDescription.UTF8String);
@@ -1278,6 +1454,16 @@ struct GSMetalBackend::Impl
             off += size_t(r.w) * r.h;
         }
         [blit endEncoding];
+        if (hi && p.hiTex)
+        {
+            if (!p.hiValid)
+            {
+                rects.clear();
+                rects.push_back({0u, 0u, p.width, p.height});
+            }
+            EncodeUpscale(cmd, p, rects);
+            p.hiValid = true;
+        }
         if (!wasValid)
             ++frame.targetUploads;
         else
@@ -1285,6 +1471,24 @@ struct GSMetalBackend::Impl
         frame.uploadPixels += words;
         if (timing)
             frame.uploadNs += nowNs() - tu0;
+    }
+
+    void EncodeUpscale(id<MTLCommandBuffer> cmd, Plane &p, const std::vector<PageRect> &rects)
+    {
+        id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
+        [ce setComputePipelineState:hiUpscale];
+        [ce setTexture:p.tex atIndex:0];
+        [ce setTexture:p.hiTex atIndex:1];
+        const uint32_t sc[2] = {hsx, hsy};
+        [ce setBytes:sc length:sizeof(sc) atIndex:1];
+        for (const PageRect &r : rects)
+        {
+            const uint32_t rr[4] = {r.x, r.y, r.w, r.h};
+            [ce setBytes:rr length:sizeof(rr) atIndex:0];
+            [ce dispatchThreads:MTLSizeMake(r.w * hsx, r.h * hsy, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            hiUpscalePx += uint64_t(r.w) * r.h;
+        }
+        [ce endEncoding];
     }
 
     // ---- GPU-newer pixels -> shadow
@@ -1552,6 +1756,8 @@ struct GSMetalBackend::Impl
                     }
                 }
                 [enc endEncoding];
+                if (hi && t.c->hiTex && t.z->hiTex)
+                    EncodeHiPass(cmd, t, vb, pb);
                 CommitCur();
                 if (timing)
                     frame.encodeNs += nowNs() - te0;
@@ -1573,6 +1779,129 @@ struct GSMetalBackend::Impl
             else if (eager)
                 ResolveAll(why);
         }
+    }
+
+    // G2e: the same run into the scaled planes (display only; nothing here reaches the shadow)
+    void EncodeHiPass(id<MTLCommandBuffer> cmd, Target &t, id<MTLBuffer> vb, id<MTLBuffer> pb)
+    {
+        if (snapTex && snapTarget == &t && snapHi)
+        {
+            id<MTLBlitCommandEncoder> sb = [cmd blitCommandEncoder];
+            [sb copyFromTexture:t.c->hiTex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake(t.c->hiTex.width, t.c->hiTex.height, 1) toTexture:snapHi destinationSlice:0 destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [sb endEncoding];
+        }
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = t.c->hiTex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[1].texture = t.z->hiTex;
+        rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
+        rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:hiPipeline];
+        MTLViewport vp = {0.0, 0.0, double(t.c->width * hsx), double(t.c->height * hsy), 0.0, 1.0};
+        [enc setViewport:vp];
+        const float size[2] = {float(t.c->width), float(t.c->height)}; // native positions: the viewport scales them
+        struct
+        {
+            float sx, sy;
+            uint32_t isx, isy, dbg;
+        } hp = {float(hsx), float(hsy), hsx, hsy, hiDbg};
+        [enc setVertexBuffer:vb offset:0 atIndex:0];
+        [enc setVertexBytes:size length:sizeof(size) atIndex:1];
+        [enc setFragmentBuffer:pb offset:0 atIndex:0];
+        [enc setFragmentBuffer:palBuf offset:0 atIndex:1];
+        [enc setFragmentBytes:&hp length:sizeof(hp) atIndex:2];
+        if (segments.empty())
+        {
+            [enc setFragmentTexture:dummyTex atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:verts.size()];
+        }
+        else
+            for (size_t i = 0; i < segments.size(); ++i)
+            {
+                const uint32_t first = segments[i].first;
+                const uint32_t last = (i + 1 < segments.size()) ? segments[i + 1].first : uint32_t(verts.size());
+                if (last <= first)
+                    continue;
+                [enc setFragmentTexture:(segments[i].hiTex ? segments[i].hiTex : segments[i].tex) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:first vertexCount:last - first];
+            }
+        [enc endEncoding];
+        ++hiPasses;
+    }
+
+    // G2e: the scaled display frame, from the plane the 1x present chose (its PCRTC decision is reused).
+    // Falls back to a nearest upscale of the 1x frame when that plane is not available.
+    void BuildHiFrame(const GSPresentationRequest &req, const PresentationFrame &f)
+    {
+        if (!f)
+            return;
+        ++hiPresents;
+        const bool en1 = (req.pmode & 1u) != 0u, en2 = (req.pmode & 2u) != 0u;
+        const bool field = (req.smode2 & 1u) != 0u && (req.smode2 & 2u) != 0u;
+        if ((req.pmode != lastPmode || req.smode2 != lastSmode2) && modeLogs < 40u)
+        {
+            ++modeLogs;
+            std::fprintf(stderr, "[gsmtl-hi] pmode=0x%llx smode2=0x%llx dispfb1=0x%llx dispfb2=0x%llx frame %ux%u src=%u disp=%u field=%d tick=%llu\n",
+                         (unsigned long long)req.pmode, (unsigned long long)req.smode2, (unsigned long long)req.dispfb1, (unsigned long long)req.dispfb2,
+                         f.width, f.height, f.sourceFbp, f.displayFbp, int(field), (unsigned long long)req.vsyncTick);
+            std::fflush(stderr);
+        }
+        lastPmode = req.pmode;
+        lastSmode2 = req.smode2;
+        const uint32_t outW = f.width * hsx, outH = f.height * hsx;
+        std::vector<uint8_t> px(size_t(outW) * outH * 4u);
+        bool ok = false;
+        const uint64_t dfb = (en1 && !en2) ? req.dispfb1 : ((!en1 && en2) ? req.dispfb2 : 0ull);
+        const uint32_t dFbp = uint32_t(dfb & 0x1FFu), dFbw = uint32_t((dfb >> 9) & 0x3Fu), dPsm = uint32_t((dfb >> 15) & 0x1Fu);
+        if (dfb != 0ull && (dPsm == GS_PSM_CT32 || dPsm == GS_PSM_CT24))
+        {
+            const bool same = f.sourceFbp == dFbp && !f.usedPreferred;
+            Plane *P = nullptr;
+            for (auto &q : planes)
+                if (!q->depth && q->base == f.sourceFbp && q->hiTex && q->valid && (!same || q->fbw == dFbw))
+                {
+                    P = q.get();
+                    break;
+                }
+            if (P)
+            {
+                @autoreleasepool
+                {
+                    if (PlaneStale(*P) && !(run && (P == run->c) && !prims.empty()))
+                        EncodeRefill(*P); // the shadow is newer (CPU-side writes): the scaled copy follows it
+                    const uint32_t ox = (same ? uint32_t((dfb >> 32) & 0x7FFu) : 0u) * hsx;
+                    const uint32_t oy = (same ? uint32_t((dfb >> 43) & 0x7FFu) : 0u) * hsy;
+                    const uint32_t scan = field ? std::max<uint32_t>(1u, f.height / 2u) : f.height;
+                    const uint32_t prm[6] = {ox, oy, outW, outH, scan * hsy, outH};
+                    if (!hiOut || hiOut.length < px.size())
+                        hiOut = [device newBufferWithLength:px.size() options:MTLResourceStorageModeShared];
+                    id<MTLCommandBuffer> cmd = GetCmd();
+                    id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
+                    [ce setComputePipelineState:hiPresent];
+                    [ce setTexture:P->hiTex atIndex:0];
+                    [ce setBuffer:hiOut offset:0 atIndex:0];
+                    [ce setBytes:prm length:sizeof(prm) atIndex:1];
+                    [ce dispatchThreads:MTLSizeMake(outW, outH, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+                    [ce endEncoding];
+                    CommitCur();
+                    WaitAll(kFlushPresent);
+                    std::memcpy(px.data(), hiOut.contents, px.size());
+                    ok = true;
+                }
+            }
+        }
+        if (!ok)
+        {
+            ++hiFallbacks;
+            for (uint32_t y = 0; y < outH; ++y)
+                for (uint32_t x = 0; x < outW; ++x)
+                    std::memcpy(&px[(size_t(y) * outW + x) * 4u], &f.pixels[(size_t(y / hsx) * 640u + x / hsx) * 4u], 4);
+        }
+        GSMetalPublishHires(std::move(px), outW, outH, GSMetalFrameKey(f.pixels.data(), f.width, f.height, 640u * 4u));
     }
 
     // compatibility name used throughout
@@ -1877,7 +2206,7 @@ struct GSMetalBackend::Impl
     }
 
     // Start (or continue) the draw segment that binds `tex` for the primitives recorded next.
-    void BindSegment(id<MTLTexture> tex)
+    void BindSegment(id<MTLTexture> tex, id<MTLTexture> hiTex = nil)
     {
         if (!tex)
         {
@@ -1892,9 +2221,12 @@ struct GSMetalBackend::Impl
         {
             const uint32_t first = uint32_t(verts.size());
             if (!segments.empty() && segments.back().first == first)
+            {
                 segments.back().tex = tex;
+                segments.back().hiTex = hiTex;
+            }
             else
-                segments.push_back({first, tex});
+                segments.push_back({first, tex, hiTex});
             curTex = tex;
         }
     }
@@ -2114,11 +2446,26 @@ struct GSMetalBackend::Impl
             }
             snapTarget = run;
             primTex = snapTex;
+            if (hi && T->hiTex)
+            {
+                if (!snapHi || snapHi.width != T->hiTex.width || snapHi.height != T->hiTex.height)
+                {
+                    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+                                                                                                 width:T->hiTex.width
+                                                                                                height:T->hiTex.height
+                                                                                             mipmapped:NO];
+                    d.usage = MTLTextureUsageShaderRead;
+                    d.storageMode = MTLStorageModePrivate;
+                    snapHi = [device newTextureWithDescriptor:d];
+                }
+                primTexHi = snapHi;
+            }
             ++frame.metalSelfPrims;
         }
         else
         {
             primTex = T->tex;
+            primTexHi = T->hiTex;
             ++frame.metalFbPrims;
         }
         fbSrc = true;
@@ -2265,6 +2612,13 @@ struct GSMetalBackend::Impl
                 p.q1 = sg.h;
                 p.uv0 = uint32_t(sg.un0x);
                 p.uv1 = uint32_t(sg.un0y);
+                if (hi)
+                {
+                    // drawn rectangle for the scaled pass (unused by the 1x pass)
+                    p.uv2 = uint32_t(x0) | (uint32_t(x1) << 16);
+                    const uint32_t gy = uint32_t(y0) | (uint32_t(y1) << 16);
+                    std::memcpy(&p.q2, &gy, 4);
+                }
                 FillTex(p, state);
             }
         }
@@ -2358,6 +2712,10 @@ GSMetalBackend::~GSMetalBackend()
         Stats t = m->total;
         t.Add(m->frame);
         GSMetalPrintStats("total", t);
+        std::fprintf(stderr, "[gsmtl-hi] total scale=%ux%u passes=%llu presents=%llu fallbacks=%llu upscale_px=%llu gpu_busy_s=%.3f\n", m->hsx, m->hsy,
+                     (unsigned long long)m->hiPasses, (unsigned long long)m->hiPresents, (unsigned long long)m->hiFallbacks,
+                     (unsigned long long)m->hiUpscalePx, m->gpuBusyS);
+        std::fflush(stderr);
     }
 }
 
@@ -2477,6 +2835,29 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
         b->m->lib = lib; // self-test pipelines are created on first use
         b->m->wbScatter = wbs;
         b->m->cpuWriteback = std::getenv("PS2X_GS_METAL_CPU_WRITEBACK") != nullptr;
+        {
+            const char *sc = std::getenv("PS2X_GS_SCALE");
+            const int scale = std::min(8, std::max(1, sc ? std::atoi(sc) : 1));
+            const char *pg = std::getenv("PS2X_GS_PROGRESSIVE");
+            const bool prog = pg ? std::atoi(pg) != 0 : scale > 1;
+            b->m->hsx = uint32_t(scale);
+            b->m->hsy = uint32_t(scale) * (prog ? 2u : 1u);
+            if (b->m->hsx > 1u || b->m->hsy > 1u)
+            {
+                NSError *herr = nil;
+                MTLRenderPipelineDescriptor *hd = [MTLRenderPipelineDescriptor new];
+                hd.vertexFunction = pd.vertexFunction;
+                hd.fragmentFunction = [lib newFunctionWithName:@"fs_hi"];
+                hd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Uint;
+                hd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
+                b->m->hiPipeline = [device newRenderPipelineStateWithDescriptor:hd error:&herr];
+                b->m->hiUpscale = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"hi_upscale"] error:&herr];
+                b->m->hiPresent = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"hi_present"] error:&herr];
+                b->m->hi = b->m->hiPipeline && b->m->hiUpscale && b->m->hiPresent;
+                std::fprintf(stderr, "[gsmtl-hi] display scale %ux%u %s%s\n", b->m->hsx, b->m->hsy, b->m->hi ? "on" : "FAILED: ",
+                             b->m->hi ? "" : (herr ? herr.localizedDescription.UTF8String : "?"));
+            }
+        }
         b->m->cpu = std::make_unique<GSCpuBackend>();
         // page tables (filled by the GSCpuBackend constructor above) for the write-back scatter
         {
@@ -2543,6 +2924,7 @@ void GSMetalBackend::Submit(const GSPrimitiveBatch &batch)
             m->frame.fallbackNs += nowNs() - t0;
     };
     m->fbSrc = false;
+    m->primTexHi = nil;
     if (const char *reason = m->Eligible(batch))
     {
         fallback(reason);
@@ -2601,7 +2983,7 @@ void GSMetalBackend::Submit(const GSPrimitiveBatch &batch)
     if (m->ts.on)
         ++m->frame.metalTexPrims;
     ++m->runPrims;
-    m->BindSegment(m->ts.on ? m->primTex : nil);
+    m->BindSegment(m->ts.on ? m->primTex : nil, m->ts.on ? m->primTexHi : nil);
     m->Record(batch, rtz);
     if (m->prims.size() >= 65536u)
         m->CloseRun(kFlushLimit);
@@ -2732,8 +3114,15 @@ PresentationFrame GSMetalBackend::Present(const GSPresentationRequest &request)
         Stats t = m->total;
         t.Add(m->frame);
         GSMetalPrintStats("progress", t);
+        std::fprintf(stderr, "[gsmtl-hi] scale=%ux%u passes=%llu presents=%llu fallbacks=%llu upscale_px=%llu gpu_busy_s=%.3f\n", m->hsx, m->hsy,
+                     (unsigned long long)m->hiPasses, (unsigned long long)m->hiPresents, (unsigned long long)m->hiFallbacks,
+                     (unsigned long long)m->hiUpscalePx, m->gpuBusyS);
+        std::fflush(stderr);
     }
-    return m->cpu->Present(request);
+    PresentationFrame result = m->cpu->Present(request);
+    if (m->hi)
+        m->BuildHiFrame(request, result);
+    return result;
 }
 
 bool GSMetalBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)

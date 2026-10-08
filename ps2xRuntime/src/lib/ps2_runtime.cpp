@@ -457,6 +457,35 @@ namespace
 
 extern std::atomic<uint32_t> g_ps2xPort0PadReads;
 
+#if defined(__APPLE__)
+bool GSMetalCopyHiresFrame(std::vector<uint8_t> &px, uint32_t &w, uint32_t &h, uint64_t key);
+uint64_t GSMetalFrameKey(const uint8_t *px, uint32_t w, uint32_t h, uint32_t strideBytes);
+#endif
+
+// G2e: PS2X_DUMP_FRAMES_HIRES=<dir> writes the scaled display frame (PS2X_GS_SCALE > 1, Metal) next to each 1x dump,
+// under the same file name.
+static void dumpHiresFrame(const char *name, const uint8_t *px1x, uint32_t w1x, uint32_t h1x)
+{
+#if defined(__APPLE__)
+    static const char *s_dir = std::getenv("PS2X_DUMP_FRAMES_HIRES");
+    if (!s_dir || s_dir[0] == '\0')
+        return;
+    std::vector<uint8_t> px;
+    uint32_t w = 0u, h = 0u;
+    if (!GSMetalCopyHiresFrame(px, w, h, GSMetalFrameKey(px1x, w1x, h1x, w1x * 4u)) || w == 0u || h == 0u)
+    {
+        std::fprintf(stderr, "[hires] no scaled frame pairs with %s\n", name);
+        return;
+    }
+    Image img{px.data(), static_cast<int>(w), static_cast<int>(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+    char path[768];
+    std::snprintf(path, sizeof(path), "%s/%s", s_dir, name);
+    ExportImage(img, path);
+#else
+    (void)name; (void)px1x; (void)w1x; (void)h1x;
+#endif
+}
+
 void PS2Runtime::dumpPresentationFrame(const char *dir, uint64_t tick)
 {
     // Latch and read back exactly this frame (with the GS thread this waits for its delivery).
@@ -471,6 +500,43 @@ void PS2Runtime::dumpPresentationFrame(const char *dir, uint64_t tick)
     std::snprintf(name, sizeof(name), "%s/frame_%06llu_r%u.png", dir, static_cast<unsigned long long>(tick),
                   g_ps2xPort0PadReads.load(std::memory_order_relaxed));
     ExportImage(img, name);
+    dumpHiresFrame(name + std::strlen(dir) + 1u, pixels.data(), width, height);
+}
+
+// G2e: with PS2X_GS_SCALE > 1 (Metal) the window shows the scaled frame paired with the 1x frame (interim
+// readback until M4 presents the Metal texture directly).
+static Texture2D g_hiresTex{};
+static bool g_hiresTexValid = false;
+
+static void UploadHiresFrame(const std::vector<uint8_t> &frame1x, uint32_t width, uint32_t height)
+{
+#if defined(__APPLE__)
+    static const bool s_on = []()
+    {
+        const char *v = std::getenv("PS2X_GS_SCALE");
+        return v && std::atoi(v) > 1;
+    }();
+    g_hiresTexValid = false;
+    if (!s_on || frame1x.size() < static_cast<size_t>(width) * height * 4u)
+        return;
+    static std::vector<uint8_t> s_hi;
+    uint32_t hw = 0u, hh = 0u;
+    if (!GSMetalCopyHiresFrame(s_hi, hw, hh, GSMetalFrameKey(frame1x.data(), width, height, width * 4u)) || hw == 0u || hh == 0u)
+        return;
+    if (g_hiresTex.id == 0u || g_hiresTex.width != static_cast<int>(hw) || g_hiresTex.height != static_cast<int>(hh))
+    {
+        if (g_hiresTex.id != 0u)
+            UnloadTexture(g_hiresTex);
+        Image im{s_hi.data(), static_cast<int>(hw), static_cast<int>(hh), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        g_hiresTex = LoadTextureFromImage(im);
+        SetTextureFilter(g_hiresTex, TEXTURE_FILTER_BILINEAR);
+    }
+    else
+        UpdateTexture(g_hiresTex, s_hi.data());
+    g_hiresTexValid = g_hiresTex.id != 0u;
+#else
+    (void)frame1x; (void)width; (void)height;
+#endif
 }
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
@@ -593,7 +659,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
 
     if (tex.id != 0u) // no texture (and no GL context) in PS2X_HEADLESS no-window mode
+    {
         UpdateTexture(tex, s_uploadBuffer.data());
+        UploadHiresFrame(s_scratch, width, height);
+    }
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -629,6 +698,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             std::snprintf(name, sizeof(name), "%s/frame_%06u_d%u_s%u%s_r%u.png", s_dumpDir, s_presentIndex - 1u, displayFbp, sourceFbp, usedPreferredDisplaySource ? "_p" : "",
                           g_ps2xPort0PadReads.load(std::memory_order_relaxed));
             ExportImage(img, name);
+            dumpHiresFrame(name + std::strlen(s_dumpDir) + 1u, rgba.data(), w, h);
         }
     }
 }
@@ -2748,7 +2818,11 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (g_hiresTexValid)
+            DrawTexturePro(g_hiresTex, Rectangle{0.0f, 0.0f, static_cast<float>(g_hiresTex.width), static_cast<float>(g_hiresTex.height)}, dstRect,
+                           Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        else
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
