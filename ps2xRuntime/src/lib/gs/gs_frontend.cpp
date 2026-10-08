@@ -117,13 +117,19 @@ namespace
 
 namespace
 {
-    // PS2X_GS_BACKEND=cpu (default) | metal | tee (Metal plan M1). Metal and tee are macOS only and
-    // fall back to the CPU backend when no Metal device is available.
+    // PS2X_GS_BACKEND=metal | cpu | tee (Metal plan M1/M8). Unset or empty: Metal on macOS when the
+    // Metal device initialises (G2f, M8), else the CPU backend. cpu keeps the CPU reference backend
+    // (frames are byte-identical across backends). Metal and tee are macOS only and fall back to
+    // the CPU backend, with a log line, when no Metal device is available.
     std::unique_ptr<GSRasterBackend> makeInnerRasterBackend()
     {
         const char *sel = std::getenv("PS2X_GS_BACKEND");
-        const std::string which = sel ? sel : "cpu";
-        if (which == "cpu" || which.empty())
+#if defined(__APPLE__)
+        const std::string which = (sel && *sel) ? sel : "metal";
+#else
+        const std::string which = (sel && *sel) ? sel : "cpu";
+#endif
+        if (which == "cpu")
             return std::make_unique<GSCpuBackend>();
 #if defined(__APPLE__)
         if (which == "metal" || which == "tee")
@@ -140,7 +146,8 @@ namespace
                                          std::getenv("PS2X_GS_METAL_SELFTEST_SEED") ? static_cast<uint32_t>(std::atoi(std::getenv("PS2X_GS_METAL_SELFTEST_SEED"))) : 1u);
                 return metal;
             }
-            std::fprintf(stderr, "[gs] PS2X_GS_BACKEND=%s unavailable; using the CPU backend\n", which.c_str());
+            std::fprintf(stderr, "[gs] %s backend%s unavailable (Metal init failed); using the CPU backend\n",
+                         which.c_str(), (sel && *sel) ? "" : " (default)");
             return std::make_unique<GSCpuBackend>();
         }
 #endif
