@@ -279,6 +279,16 @@ public:
     uint64_t dmaStartCount() const { return m_dmaStartCount.load(std::memory_order_relaxed); }
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
+    // DISPFB1/DISPFB2 writes that changed the register (game frame swaps; fps meter).
+    uint64_t dispfbSwapCount() const { return m_dispfbSwapCount.load(std::memory_order_relaxed); }
+    uint64_t dispfb2SwapCount() const { return m_dispfb2SwapCount.load(std::memory_order_relaxed); }
+    void noteGsPrivWrite(const uint64_t *reg, uint64_t oldValue, uint64_t newValue)
+    {
+        if ((reg == &gs_regs.dispfb1 || reg == &gs_regs.dispfb2) && oldValue != newValue)
+            m_dispfbSwapCount.fetch_add(1, std::memory_order_relaxed);
+        if (reg == &gs_regs.dispfb2 && oldValue != newValue)
+            m_dispfb2SwapCount.fetch_add(1, std::memory_order_relaxed);
+    }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
@@ -373,6 +383,8 @@ public:
     std::atomic<uint64_t> m_dmaStartCount{0};
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
+    std::atomic<uint64_t> m_dispfbSwapCount{0};
+    std::atomic<uint64_t> m_dispfb2SwapCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};
     std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};

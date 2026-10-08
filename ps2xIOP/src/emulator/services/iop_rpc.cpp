@@ -22,7 +22,7 @@ namespace ps2x::iop::detail
     {
         m_servers.clear();
         m_nextDmaId = 1u;
-        m_sifInitialized = false;
+        m_sifInitialized = true;
     }
 
     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)

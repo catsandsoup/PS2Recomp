@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <cstring>
 
+// Path of the packet currently being processed (diagnostics: vertex/triangle traces).
+thread_local uint8_t g_gifCurrentPath = 0u;
+
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
@@ -56,7 +59,9 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
+            g_gifCurrentPath = static_cast<uint8_t>(pkt.pathId);
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            g_gifCurrentPath = 0u;
         }
     }
     m_queue.clear();

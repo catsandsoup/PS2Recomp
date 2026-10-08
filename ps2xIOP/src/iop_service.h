@@ -23,6 +23,13 @@ namespace ps2x::iop::detail
         {
             return {};
         }
+        // A native replacement for a game IRX: when true, loading any module named in
+        // moduleAliases() skips the physical IRX and activates this service instead.
+        [[nodiscard]] virtual bool replacesPhysicalModule() const
+        {
+            return false;
+        }
+
         virtual void reset() = 0;
 
         [[nodiscard]] virtual RpcAbi selectRpcAbi(const RpcAbiRequest &request) const

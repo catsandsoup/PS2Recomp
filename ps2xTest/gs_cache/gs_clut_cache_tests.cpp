@@ -61,20 +61,21 @@ namespace
         expectEqual(f.sample(), kGreen, "CLD=1 reloads the palette");
     }
 
-    void clutUsesPageCache()
+    // CLUT loads read local memory as it is now (no texture page buffer; see the texture suite).
+    void clutReadsCurrentMemory()
     {
         FrontendFixture f;
         auto tex = texture(GS_PSM_T4, 64);
         f.index(tex, 8);
         f.palette(tex, 8, kRed);
         f.bind(tex);
-        // No texture sampling between loads: the CLUT source page is still resident.
+        expectEqual(f.sample(), kRed, "first load");
         f.palette(tex, 8, kGreen);
         f.bind(tex);
-        expectEqual(f.sample(), kRed, "CLD=1 alone does not invalidate the texture page buffer");
+        expectEqual(f.sample(), kGreen, "CLD=1 reload sees the new palette without TEXFLUSH");
         f.flush();
         f.bind(tex);
-        expectEqual(f.sample(), kGreen, "identical TEX0 write still loads after TEXFLUSH");
+        expectEqual(f.sample(), kGreen, "identical TEX0 write after TEXFLUSH still loads");
     }
 
     template<unsigned Bank>
@@ -272,7 +273,7 @@ int main(int argc, char** argv)
         {"unaligned_csm1_ct16", unalignedCsm1<GS_PSM_CT16>},
         {"unaligned_csm1_ct16s", unalignedCsm1<GS_PSM_CT16S>},
         {"wrapped_clut", wrappedClut}, {"unaligned_csm2", unalignedCsm2},
-        {"retained_palette", retainedPalette}, {"clut_uses_page_cache", clutUsesPageCache},
+        {"retained_palette", retainedPalette}, {"clut_reads_current_memory", clutReadsCurrentMemory},
         {"cbp0_conditional", conditionalLoad<0>}, {"cbp1_conditional", conditionalLoad<1>},
         {"reserved_cld", reservedCld}, {"nonindexed_cld", nonIndexedCld},
         {"tex2_reload", tex2Reload}, {"shared_contexts", sharedContexts},

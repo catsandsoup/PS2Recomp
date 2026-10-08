@@ -1,3 +1,11 @@
+#include "runtime/ps2_vu1_recomp.h"
+#include <cfenv>
+#include <filesystem>
+#include <mutex>
+#include <set>
+#include <map>
+#include <cstdlib>
+#include "ps2x/iop/native_audio.h"
 #include "ps2_runtime.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
@@ -87,6 +95,80 @@ struct ProgramHeader
 
 namespace
 {
+    // Native (statically recompiled) VU1 programs; see runtime/ps2_vu1_recomp.h.
+    Vu1NativeDispatcher &vu1NativeDispatcher()
+    {
+        static Vu1NativeDispatcher dispatcher;
+        return dispatcher;
+    }
+
+    // PS2X_VU1_CATALOG=<dir>: record every distinct VU1 code image and microprogram entry point.
+    // Images go to <dir>/<hash>.vu1 (16 KiB micro memory); entries to <dir>/index.txt as
+    // "<hash> <startPC> <calls>" (rewritten every 256 new calls). Input for the VU1 static recompiler.
+    void catalogVu1Program(const uint8_t *code, uint32_t startPC)
+    {
+        static const char *s_dir = std::getenv("PS2X_VU1_CATALOG");
+        if (!s_dir || s_dir[0] == '\0' || !code)
+            return;
+
+        uint64_t hash = 1469598103934665603ull;
+        for (uint32_t i = 0; i < PS2_VU1_CODE_SIZE; ++i)
+        {
+            hash ^= code[i];
+            hash *= 1099511628211ull;
+        }
+
+        static std::mutex s_mutex;
+        static std::map<std::pair<uint64_t, uint32_t>, uint64_t> s_entries;
+        static std::set<uint64_t> s_images;
+        static uint64_t s_calls = 0u;
+        static bool s_loaded = false;
+        std::lock_guard<std::mutex> lock(s_mutex);
+        if (!s_loaded)
+        {
+            // Merge with an existing catalog instead of replacing it, so a short session
+            // never drops entries (index.txt drives VU1 code generation).
+            s_loaded = true;
+            const std::filesystem::path index = std::filesystem::path(s_dir) / "index.txt";
+            if (FILE *f = std::fopen(index.string().c_str(), "r"))
+            {
+                unsigned long long h = 0, calls = 0;
+                unsigned pcv = 0;
+                while (std::fscanf(f, "%llx %x %llu", &h, &pcv, &calls) == 3)
+                {
+                    s_entries[{static_cast<uint64_t>(h), static_cast<uint32_t>(pcv)}] += calls;
+                    s_images.insert(static_cast<uint64_t>(h));
+                }
+                std::fclose(f);
+            }
+        }
+
+        char name[64];
+        std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(hash));
+        if (s_images.insert(hash).second)
+        {
+            const std::filesystem::path path = std::filesystem::path(s_dir) / (std::string(name) + ".vu1");
+            if (FILE *f = std::fopen(path.string().c_str(), "wb"))
+            {
+                std::fwrite(code, 1, PS2_VU1_CODE_SIZE, f);
+                std::fclose(f);
+            }
+        }
+        const bool newEntry = s_entries.find({hash, startPC}) == s_entries.end();
+        ++s_entries[{hash, startPC}];
+        if (newEntry || (++s_calls % 256u) == 0u)
+        {
+            const std::filesystem::path index = std::filesystem::path(s_dir) / "index.txt";
+            if (FILE *f = std::fopen(index.string().c_str(), "w"))
+            {
+                for (const auto &[key, calls] : s_entries)
+                    std::fprintf(f, "%016llx %04x %llu\n", static_cast<unsigned long long>(key.first), key.second,
+                                 static_cast<unsigned long long>(calls));
+                std::fclose(f);
+            }
+        }
+    }
+
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
@@ -373,6 +455,24 @@ namespace
     }
 }
 
+extern std::atomic<uint32_t> g_ps2xPort0PadReads;
+
+void PS2Runtime::dumpPresentationFrame(const char *dir, uint64_t tick)
+{
+    // Latch and read back exactly this frame (with the GS thread this waits for its delivery).
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0u, height = 0u;
+    if (!gs().latchHostPresentationFrameAndCopy(pixels, width, height) || width == 0u || height == 0u)
+        return;
+    for (size_t i = 3; i < pixels.size(); i += 4)
+        pixels[i] = 0xFFu;
+    Image img{pixels.data(), static_cast<int>(width), static_cast<int>(height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+    char name[512];
+    std::snprintf(name, sizeof(name), "%s/frame_%06llu_r%u.png", dir, static_cast<unsigned long long>(tick),
+                  g_ps2xPort0PadReads.load(std::memory_order_relaxed));
+    ExportImage(img, name);
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -387,19 +487,39 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    const bool gameDriven = rt->gs().gameDrivenPresentation();
+    static uint64_t s_lastGameLatchSerial = 0u;
+    const uint64_t gameLatchSerial = rt->gs().hostPresentationSerial();
+    const bool needsLatch = !gameDriven && (!s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick);
+    if (gameDriven)
+    {
+        if (gameLatchSerial == s_lastGameLatchSerial && s_hasUploadedFrame)
+        {
+            outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
+            outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+            return;
+        }
+        s_lastGameLatchSerial = gameLatchSerial;
+    }
     if (needsLatch)
     {
         rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
-    else if (s_hasUploadedFrame)
+    // Upload only when a newer frame has been delivered to the mailbox. With the synchronous
+    // backend every latch delivers immediately (same behaviour as before); with the GS thread
+    // (PS2X_GS_THREAD=1) a latch is queued and its frame arrives a little later, so the window
+    // picks up the newest completed frame on a later host frame instead of re-uploading an old one.
+    static uint64_t s_lastUploadedSerial = 0u;
+    const uint64_t deliveredSerial = rt->gs().hostPresentationSerial();
+    if (!gameDriven && s_hasUploadedFrame && deliveredSerial == s_lastUploadedSerial)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
         return;
     }
+    s_lastUploadedSerial = deliveredSerial;
 
     s_scratch.clear();
     uint32_t width = 0u;
@@ -415,7 +535,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &usedPreferredDisplaySource))
     {
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
-        UpdateTexture(tex, blank.data);
+        if (tex.id != 0u) // no texture (and no GL context) in PS2X_HEADLESS no-window mode
+            UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
@@ -471,10 +592,45 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
-    UpdateTexture(tex, s_uploadBuffer.data());
+    if (tex.id != 0u) // no texture (and no GL context) in PS2X_HEADLESS no-window mode
+        UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+
+    // Bring-up aid: PS2X_DUMP_FRAMES=<dir> writes every PS2X_DUMP_EVERY-th (default 50) presented frame as PNG.
+    static const char *s_dumpDir = std::getenv("PS2X_DETERMINISTIC") ? nullptr : std::getenv("PS2X_DUMP_FRAMES");
+    if (s_dumpDir && s_dumpDir[0] != '\0' && width != 0u && height != 0u)
+    {
+        static uint32_t s_dumpEvery = []()
+        {
+            const char *every = std::getenv("PS2X_DUMP_EVERY");
+            const long value = every ? std::strtol(every, nullptr, 10) : 50;
+            return static_cast<uint32_t>(value > 0 ? value : 50);
+        }();
+        static uint32_t s_presentIndex = 0u;
+        if ((s_presentIndex++ % s_dumpEvery) == 0u)
+        {
+            const uint32_t w = std::min<uint32_t>(width, FB_WIDTH);
+            const uint32_t h = std::min<uint32_t>(height, FB_HEIGHT);
+            std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4u);
+            for (uint32_t y = 0; y < h; ++y)
+            {
+                std::memcpy(rgba.data() + static_cast<size_t>(y) * w * 4u,
+                            s_uploadBuffer.data() + static_cast<size_t>(y) * FB_WIDTH * 4u,
+                            static_cast<size_t>(w) * 4u);
+            }
+            for (size_t i = 3; i < rgba.size(); i += 4)
+            {
+                rgba[i] = 0xFFu; // GS alpha is not display alpha
+            }
+            Image img{rgba.data(), static_cast<int>(w), static_cast<int>(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+            char name[512];
+            std::snprintf(name, sizeof(name), "%s/frame_%06u_d%u_s%u%s_r%u.png", s_dumpDir, s_presentIndex - 1u, displayFbp, sourceFbp, usedPreferredDisplaySource ? "_p" : "",
+                          g_ps2xPort0PadReads.load(std::memory_order_relaxed));
+            ExportImage(img, name);
+        }
+    }
 }
 
 PS2Runtime::PS2Runtime()
@@ -524,11 +680,88 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
     m_debugUiUserData = userData;
 }
 
+#if !defined(PLATFORM_VITA)
+namespace
+{
+    // Host stream for native IOP sound services (SNDMOD replacement).  raylib
+    // pulls 48 kHz s16 stereo from ps2x::iop::renderNativeAudio on its audio thread.
+    AudioStream g_nativeAudioStream{};
+    bool g_nativeAudioStreamLoaded = false;
+
+    // PS2X_MUTE=1 (implied by PS2X_HEADLESS=1 unless PS2X_MUTE=0): the native sound engine still
+    // renders every sample (timing, PS2X_AUDIO_DUMP and the IOP state are unchanged) but nothing
+    // reaches the speakers. Automated runs must never be audible to the user.
+    bool hostAudioMuted()
+    {
+        static const bool muted = []()
+        {
+            if (const char *mute = std::getenv("PS2X_MUTE"); mute && mute[0] != '\0')
+                return mute[0] != '0';
+            const char *headless = std::getenv("PS2X_HEADLESS");
+            return headless && headless[0] == '1';
+        }();
+        return muted;
+    }
+
+    // PS2X_HEADLESS=1: no window and no GL context at all (PS2X_HEADLESS_WINDOW=1 restores the old
+    // hidden-window behaviour). Automated runs must work with the lid closed or the display asleep:
+    // GLFW then finds no monitor and InitWindow crashes (2026-10-08). Frame latching, frame dumps,
+    // audio and scripted input don't need a window; only the on-screen blit does.
+    bool hostNoWindow()
+    {
+        static const bool noWindow = []()
+        {
+            const char *headless = std::getenv("PS2X_HEADLESS");
+            const char *keepWindow = std::getenv("PS2X_HEADLESS_WINDOW");
+            return headless && headless[0] == '1' && !(keepWindow && keepWindow[0] == '1');
+        }();
+        return noWindow;
+    }
+
+    void nativeAudioCallback(void *buffer, unsigned int frames)
+    {
+        ps2x::iop::renderNativeAudio(static_cast<int16_t *>(buffer), frames);
+        if (hostAudioMuted())
+            std::memset(buffer, 0, static_cast<size_t>(frames) * ps2x::iop::kNativeAudioChannels * sizeof(int16_t));
+    }
+
+    void startNativeAudioStream()
+    {
+        if (g_nativeAudioStreamLoaded || !IsAudioDeviceReady())
+            return;
+        if (const char *off = std::getenv("PS2X_NATIVE_AUDIO"); off && off[0] == '0')
+            return;
+        SetAudioStreamBufferSizeDefault(1024);
+        g_nativeAudioStream = LoadAudioStream(ps2x::iop::kNativeAudioSampleRate, 16, ps2x::iop::kNativeAudioChannels);
+        SetAudioStreamBufferSizeDefault(0);
+        if (!IsAudioStreamValid(g_nativeAudioStream))
+            return;
+        SetAudioStreamCallback(g_nativeAudioStream, nativeAudioCallback);
+        PlayAudioStream(g_nativeAudioStream);
+        g_nativeAudioStreamLoaded = true;
+        ps2x::iop::markNativeAudioDeviceActive(true);
+    }
+
+    void stopNativeAudioStream()
+    {
+        if (!g_nativeAudioStreamLoaded)
+            return;
+        StopAudioStream(g_nativeAudioStream);
+        UnloadAudioStream(g_nativeAudioStream);
+        g_nativeAudioStreamLoaded = false;
+        ps2x::iop::markNativeAudioDeviceActive(false);
+    }
+}
+#endif
+
 PS2Runtime::~PS2Runtime()
 {
     try
     {
         requestStop();
+#if !defined(PLATFORM_VITA)
+        stopNativeAudioStream();
+#endif
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -679,9 +912,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                     catalogVu1Program(m_memory.getVU1Code(), startPC);
+                                     Vu1NativeDispatcher &vu1Native = vu1NativeDispatcher();
+                                     if (!vu1Native.mscal(m_vu1, m_memory, m_gs, startPC, top, itop, 65536))
+                                     {
+                                         const uint64_t before = m_vu1.cycleCount();
+                                         const double t0 = Vu1NativeDispatcher::now();
+                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                       m_gs, &m_memory, startPC, top, itop, 65536);
+                                         vu1Native.noteInterpreterRun(m_vu1.cycleCount() - before, Vu1NativeDispatcher::now() - t0);
+                                     }
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -697,6 +938,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     vu1NativeDispatcher().noteMscnt();
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
@@ -731,13 +973,24 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // PS2X_HEADLESS=1: hidden window (automated route/trace runs must not pop up over the user's
+        // desktop or take focus). Rendering and frame dumps still run.
+        unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
+        if (const char *headless = std::getenv("PS2X_HEADLESS"); headless && headless[0] == '1')
+            windowFlags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED;
+        if (!hostNoWindow())
+        {
+            SetConfigFlags(windowFlags);
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        }
         InitAudioDevice();
+        if (hostAudioMuted())
+            SetMasterVolume(0.0f);
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        startNativeAudioStream();
 #endif
         SetTargetFPS(60);
-        if (m_debugUiInitCallback)
+        if (m_debugUiInitCallback && !hostNoWindow())
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
@@ -1063,6 +1316,15 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
         paths.mcRoot = paths.elfDirectory / "mc0";
+    }
+
+    if (const char *cdImage = std::getenv("PS2X_CD_IMAGE"); cdImage && cdImage[0] != '\0')
+    {
+        paths.cdImage = std::filesystem::path(cdImage);
+    }
+    if (const char *mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot && mcRoot[0] != '\0')
+    {
+        paths.mcRoot = std::filesystem::path(mcRoot);
     }
 
     setIoPaths(paths);
@@ -2339,8 +2601,11 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+void ps2InstallCallTraces(PS2Runtime &runtime);
+
 void PS2Runtime::run()
 {
+    ps2InstallCallTraces(*this);
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
@@ -2358,15 +2623,33 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    Texture2D frameTex{};
+    if (!hostNoWindow())
+    {
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+        frameTex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+    }
 
     std::atomic<bool> gameThreadFinished{false};
 
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // The R5900 FPU and VUs round toward zero and flush denormals. Match that for all guest
+        // code on this thread (opt out with PS2X_FPU_HOST_ROUNDING=1 for comparison runs).
+        if (std::getenv("PS2X_FPU_HOST_ROUNDING") == nullptr)
+        {
+            std::fesetround(FE_TOWARDZERO);
+#if defined(__aarch64__)
+            uint64_t fpcr = 0;
+            __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+            fpcr |= (1ull << 24); // FZ: flush denormals to zero
+            __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#elif defined(__SSE2__) || defined(_M_X64)
+            _mm_setcsr(_mm_getcsr() | 0x8040u); // FTZ | DAZ
+#endif
+        }
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2420,10 +2703,36 @@ void PS2Runtime::run()
 
             }
         });
+        static const bool s_traceTicks = std::getenv("PS2X_TRACE_TICKS") != nullptr;
+        if (s_traceTicks)
+        {
+            static uint64_t s_traceTick = 0;
+            if ((++s_traceTick % 60u) == 0u)
+            {
+                const GSRegisters &gs = m_memory.gs();
+                std::cout << "[trace] t=" << s_traceTick
+                          << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                          << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
+                          << " dispfb1=0x" << gs.dispfb1 << " dispfb2=0x" << gs.dispfb2
+                          << std::dec
+                          << " dma=" << m_memory.dmaStartCount()
+                          << " gif=" << m_memory.gifCopyCount()
+                          << " gsw=" << m_memory.gsWriteCount()
+                          << " vif=" << m_memory.vifWriteCount()
+                          << std::endl;
+            }
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
+        if (hostNoWindow())
+        {
+            // Same ~60 Hz host cadence as EndDrawing() + SetTargetFPS(60) gives the windowed loop.
+            std::this_thread::sleep_for(std::chrono::microseconds(16667));
+        }
+        else
+        {
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
@@ -2452,6 +2761,20 @@ void PS2Runtime::run()
             requestStop();
             break;
         }
+        }
+        // PS2X_EXIT_AFTER_TICKS=N (tests): take the same exit path as a window close once the
+        // game reaches vsync tick N, so shutdown (game thread join, GS thread drain/join) is exercised.
+        static const uint64_t s_exitAfterTicks = []() -> uint64_t
+        {
+            const char *v = std::getenv("PS2X_EXIT_AFTER_TICKS");
+            return v ? std::strtoull(v, nullptr, 10) : 0u;
+        }();
+        if (s_exitAfterTicks != 0u && m_eeScheduler && m_eeScheduler->currentVSyncTick() >= s_exitAfterTicks)
+        {
+            std::cout << "[run] PS2X_EXIT_AFTER_TICKS reached, closing like a window close" << std::endl;
+            requestStop();
+            break;
+        }
     }
 
     requestStop();
@@ -2465,8 +2788,11 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
-    CloseWindow();
+    if (!hostNoWindow())
+    {
+        UnloadTexture(frameTex);
+        CloseWindow();
+    }
 
     RUNTIME_LOG("[run] exiting loop");
 }
