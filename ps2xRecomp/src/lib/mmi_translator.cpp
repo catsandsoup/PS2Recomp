@@ -108,11 +108,11 @@ namespace ps2recomp
                 "}}",
                 rs, rd);
         case MMI_PSLLH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_slli_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa);
+            return fmt::format("ps2_mmi_psllh(ctx, {}, {}, {});", rd, rt, sa); // shift amount is sa & 0xF (PCSX2 _PSLLH)
         case MMI_PSRLH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_srli_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa);
+            return fmt::format("ps2_mmi_psrlh(ctx, {}, {}, {});", rd, rt, sa); // shift amount is sa & 0xF (PCSX2 _PSRLH)
         case MMI_PSRAH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_srai_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa);
+            return fmt::format("ps2_mmi_psrah(ctx, {}, {}, {});", rd, rt, sa); // shift amount is sa & 0xF (PCSX2 _PSRAH)
         case MMI_PSLLW:
             return fmt::format("SET_GPR_VEC(ctx, {}, _mm_slli_epi32(GPR_VEC(ctx, {}), {}));", rd, rt, sa);
         case MMI_PSRLW:

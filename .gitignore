@@ -23,3 +23,5 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+# macOS
+.DS_Store

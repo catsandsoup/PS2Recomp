@@ -1,6 +1,19 @@
 #include "Common.h"
 #include "Pad.h"
 
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <atomic>
+#include <algorithm>
+#include <cstdio>
+
+// Port-0 pad reads so far (the PS2X_INPUT_SCRIPT clock); frame dumps are tagged with it.
+std::atomic<uint32_t> g_ps2xPort0PadReads{0u};
+
 namespace ps2_stubs
 {
     namespace
@@ -138,6 +151,74 @@ namespace ps2_stubs
             setButton(state, kPadBtnStart, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
         }
 
+        // Deterministic input replay for automated testing.
+        // PS2X_INPUT_SCRIPT=<file>; each line: "<read#> <hold_reads> <button> [button...]" or
+        // "<read#> <hold_reads> lx=<0..255> ly=<0..255>". read# counts port-0 pad reads (one per game frame).
+        struct ScriptedInput
+        {
+            uint32_t start = 0u;
+            uint32_t hold = 1u;
+            uint16_t pressedMask = 0u;
+            int lx = -1;
+            int ly = -1;
+        };
+
+        const std::vector<ScriptedInput> &inputScript()
+        {
+            static const std::vector<ScriptedInput> script = []()
+            {
+                std::vector<ScriptedInput> entries;
+                const char *path = std::getenv("PS2X_INPUT_SCRIPT");
+                if (!path || path[0] == '\0')
+                    return entries;
+                std::ifstream in(path);
+                std::string line;
+                static const std::unordered_map<std::string, uint16_t> names = {
+                    {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
+                    {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
+                    {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
+                    {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
+                    {"square", kPadBtnSquare}};
+                while (std::getline(in, line))
+                {
+                    if (line.empty() || line[0] == '#')
+                        continue;
+                    std::istringstream fields(line);
+                    ScriptedInput entry;
+                    if (!(fields >> entry.start >> entry.hold))
+                        continue;
+                    std::string token;
+                    while (fields >> token)
+                    {
+                        if (token.rfind("lx=", 0) == 0)
+                            entry.lx = std::stoi(token.substr(3));
+                        else if (token.rfind("ly=", 0) == 0)
+                            entry.ly = std::stoi(token.substr(3));
+                        else if (auto it = names.find(token); it != names.end())
+                            entry.pressedMask = static_cast<uint16_t>(entry.pressedMask | it->second);
+                    }
+                    entries.push_back(entry);
+                }
+                std::cout << "[pad] loaded " << entries.size() << " scripted input entries from " << path << std::endl;
+                return entries;
+            }();
+            return script;
+        }
+
+        void applyScriptedState(PadInputState &state, uint32_t readIndex)
+        {
+            for (const ScriptedInput &entry : inputScript())
+            {
+                if (readIndex < entry.start || readIndex >= entry.start + entry.hold)
+                    continue;
+                state.buttons = static_cast<uint16_t>(state.buttons & ~entry.pressedMask);
+                if (entry.lx >= 0)
+                    state.lx = static_cast<uint8_t>(entry.lx);
+                if (entry.ly >= 0)
+                    state.ly = static_cast<uint8_t>(entry.ly);
+            }
+        }
+
         void applyKeyboardState(PadInputState &state, bool allowAnalog)
         {
             if (!IsWindowReady())
@@ -266,6 +347,42 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
+        // PS2X_DUMP_RAM_AT=<read#>[,<read#>...] with PS2X_DUMP_RAM_DIR=<dir>: write EE RAM (32 MiB) plus
+        // VU1 code/data memory when port 0 reaches each pad-read count. Local debugging only; the dumps
+        // are disc-derived and must stay in work/.
+        void maybeDumpGuestState(PS2Runtime *runtime, uint32_t reads)
+        {
+            static const std::vector<uint32_t> points = []()
+            {
+                std::vector<uint32_t> v;
+                if (const char *s = std::getenv("PS2X_DUMP_RAM_AT"))
+                {
+                    std::stringstream ss(s);
+                    std::string item;
+                    while (std::getline(ss, item, ','))
+                        if (!item.empty())
+                            v.push_back(static_cast<uint32_t>(std::stoul(item)));
+                }
+                return v;
+            }();
+            if (!runtime || points.empty() || std::find(points.begin(), points.end(), reads) == points.end())
+                return;
+            const char *dir = std::getenv("PS2X_DUMP_RAM_DIR");
+            const std::string base = std::string(dir ? dir : ".") + "/ram_r" + std::to_string(reads);
+            auto write = [](const std::string &path, const uint8_t *data, size_t size)
+            {
+                if (FILE *f = std::fopen(path.c_str(), "wb"))
+                {
+                    std::fwrite(data, 1, size, f);
+                    std::fclose(f);
+                }
+            };
+            write(base + ".ee", runtime->memory().getRDRAM(), PS2_RAM_SIZE);
+            write(base + ".vu1code", runtime->memory().getVU1Code(), PS2_VU1_CODE_SIZE);
+            write(base + ".vu1data", runtime->memory().getVU1Data(), PS2_VU1_DATA_SIZE);
+            std::fprintf(stderr, "[dump] guest RAM at pad read %u -> %s.*\n", reads, base.c_str());
+        }
+
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
         {
             if (!outData)
@@ -308,10 +425,16 @@ namespace ps2_stubs
                     state.ly = backendData[7];
                     usedBackend = true;
                 }
-                else
+                else if (inputScript().empty() || std::getenv("PS2X_INPUT_SCRIPT_MERGE"))
                 {
+                    // A scripted run ignores live keyboard/gamepad input (the test window can have
+                    // focus on the user's desktop); PS2X_INPUT_SCRIPT_MERGE=1 opts back in.
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
+                }
+                if (port == 0 && !inputScript().empty())
+                {
+                    applyScriptedState(state, portState.readCount);
                 }
             }
 
@@ -328,6 +451,11 @@ namespace ps2_stubs
                     sharedPortState->lastReadOk = true;
                     sharedPortState->lastReadDataAddr = dataAddr;
                     ++sharedPortState->readCount;
+                    if (port == 0)
+                    {
+                        g_ps2xPort0PadReads.store(sharedPortState->readCount, std::memory_order_relaxed);
+                        maybeDumpGuestState(runtime, sharedPortState->readCount);
+                    }
                 }
             }
 

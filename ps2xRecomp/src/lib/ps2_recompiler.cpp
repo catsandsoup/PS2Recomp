@@ -1903,6 +1903,18 @@ namespace ps2recomp
         }
 
         std::unordered_set<uint32_t> guestFallbackEntryAddresses = m_entryPointHintStarts;
+        // Every configured jump-table target must be dispatchable. A JR inside a mid-function entry
+        // slice can only switch to cases inside that slice (the table-address computation sits before
+        // the slice start, so the slice's own analysis cannot see the table). Other cases go through
+        // dispatchGuestBranch and need a registered entry, or the game stops with
+        // "guest-branch:missing-target" (Laguna Raceway: JR 0x224d7c -> 0x224eb0, 2026-10-07).
+        for (const auto &table : m_config.jumpTables)
+        {
+            for (const auto &entry : table.entries)
+            {
+                guestFallbackEntryAddresses.insert(entry.target);
+            }
+        }
         for (uint32_t address : m_stubFunctionStarts)
         {
             const auto bindingIt = m_stubHandlerBindingsByStart.find(address);
