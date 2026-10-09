@@ -36,6 +36,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <map>
 #include <unistd.h>
 #include <CommonCrypto/CommonDigest.h>
 
@@ -547,7 +548,14 @@ inline FOut fs_impl(VOut in, const device Prim *prims, const device uint *pal, t
 
     if ((P.tflags & 1u) != 0u) {
         {
-            const bool fst = (P.tflags & 2u) != 0u, linear = (P.tflags & 4u) != 0u, indexed = (P.tflags & 8u) != 0u;
+            const bool fst = (P.tflags & 2u) != 0u, indexed = (P.tflags & 8u) != 0u;
+            // SX1 (HI only): s2 = post-process mode of the game's feedback sprite (1 sharp, 2 off; see Record)
+            const bool fbPost = HI && (P.flags & 1u) != 0u && (P.tflags & 4096u) != 0u && P.s2 != 0.0f;
+            if (fbPost && P.s2 >= 2.0f)
+                discard_fragment();
+            bool linear = (P.tflags & 4u) != 0u && !fbPost;
+            if (HI && (hp.dbg & 4u) != 0u && (P.flags & 1u) == 0u)
+                linear = false; // debug bit 4: triangles point-sampled (texture-filter contribution to softness)
             const uint tfx = (P.tflags >> 4) & 3u, tcc = (P.tflags >> 6) & 1u;
             const uint wms = (P.tflags >> 8) & 3u, wmt = (P.tflags >> 10) & 3u;
             const uint texW = P.texdim & 0xFFFFu, texH = P.texdim >> 16;
@@ -577,7 +585,11 @@ inline FOut fs_impl(VOut in, const device Prim *prims, const device uint *pal, t
                 }
                 const float tu = f_fma(f_sub(P.s1, P.s0, rtz), tx, P.s0, rtz);
                 const float tv = f_fma(f_sub(P.t1, P.t0, rtz), ty, P.t0, rtz);
-                if (HI && (P.tflags & 4096u) != 0u) {
+                if (fbPost) {
+                    // sharp: the other plane's own hi texel at this screen position (+ field offset)
+                    cu = in.pos.x / hp.sx;
+                    cv = in.pos.y / hp.sy + (((hp.dbg & 8u) != 0u) ? 0.0f : P.t2); // debug bit 8: no field compensation
+                } else if (HI && (P.tflags & 4096u) != 0u) {
                     cu = tu;
                     cv = tv;
                 } else if (fst) {
@@ -986,6 +998,27 @@ namespace
 }
 
 void GSMetalSetDirectHi(bool on) { g_directOn.store(on, std::memory_order_release); }
+
+// SX1: display-only post-process mode for the scaled pass (0 original, 1 sharp, 2 off). PS2X_GS_POSTFX=original|sharp|off;
+// the sdl3 shell's View > Image menu sets it live (env wins). Never affects the 1x exact path.
+namespace
+{
+    std::atomic<int> g_postFx{-1};
+}
+void GSMetalSetPostFx(int mode) { g_postFx.store(mode < 0 ? 0 : (mode > 2 ? 2 : mode), std::memory_order_release); }
+int GSMetalPostFx()
+{
+    int v = g_postFx.load(std::memory_order_acquire);
+    if (v < 0)
+    {
+        const char *e = std::getenv("PS2X_GS_POSTFX");
+        v = (e && std::strcmp(e, "sharp") == 0) ? 1 : (e && std::strcmp(e, "off") == 0) ? 2 : 0;
+        int expect = -1;
+        if (!g_postFx.compare_exchange_strong(expect, v))
+            v = expect;
+    }
+    return v;
+}
 id<MTLCommandQueue> GSMetalSharedQueue() { return g_sharedQueue; }
 bool GSMetalDirectHiOn() { return g_directOn.load(std::memory_order_acquire) && g_hiActive.load(std::memory_order_acquire); }
 
@@ -1193,6 +1226,10 @@ struct GSMetalBackend::Impl
     std::function<void(const RunInfo &)> observer;
     Stats frame;
     Stats total;
+    uint64_t sxPresents = 0; // SX1: presents seen (PS2X_GS_SX_TRACE window)
+    uint32_t lastOfy[512] = {}; // SX1: last XYOFFSET.OFY drawn into each FBP (field offset of a framebuffer source)
+    uint64_t sxPrims = 0;       // SX1: feedback sprites given a non-original post-process mode
+    std::map<std::string, uint64_t> sxHist; // SX1: matched feedback sprites by dst/src/FIX/field offset (any mode, scaled runs)
 
     void MarkPages(const PageRange &r)
     {
@@ -2740,6 +2777,47 @@ struct GSMetalBackend::Impl
                     p.uv2 = uint32_t(x0) | (uint32_t(x1) << 16);
                     const uint32_t gy = uint32_t(y0) | (uint32_t(y1) << 16);
                     std::memcpy(&p.q2, &gy, 4);
+                    // SX1: the game's full-screen cross-fade of the other framebuffer (CT24, FIX alpha, ~1/4 previous
+                    // frame, resampled 512/511 x 256/254 with bilinear + the other field's half-line offset). Sharp:
+                    // sample the other hi plane 1:1 (point) at the same screen position (field offset compensated);
+                    // off: skip it. s2 = mode, t2 = field offset in native rows; read only by fs_hi (s2/t2 are unused by
+                    // sprites in the 1x pass).
+                    const uint32_t srcFbp = ctx.tex0.tbp0 / 32u;
+                    if (fbSrc && state.prim.abe && ((ctx.alpha >> 4) & 3u) == 2u && srcFbp != ctx.frame.fbp && (ctx.tex0.tbp0 & 31u) == 0u &&
+                        (x1 - x0 + 1) * 4 >= int(ctx.frame.fbw) * 64 * 3)
+                    {
+                        const uint32_t fix = uint32_t(ctx.alpha >> 32) & 0xFFu;
+                        // field offset of the source vs this frame; unknown (no scene drawn into the source yet, e.g.
+                        // menus) or implausible (>= 1 row) -> 0 (plain 1:1)
+                        const uint32_t srcOfy = lastOfy[srcFbp & 511u];
+                        float dy = (float(ctx.xyoffset.ofy) - float(srcOfy)) / 16.0f;
+                        if (srcOfy == 0u || !(std::fabs(dy) < 1.0f))
+                            dy = 0.0f;
+                        char key[96];
+                        std::snprintf(key, sizeof(key), "dst%u<-src%u fix%u dy%+.2f", ctx.frame.fbp, srcFbp, fix, double(dy));
+                        if (++sxHist[key] == 1u || (sxPrims + 1u) % 5000u == 0u)
+                        {
+                            // logged as it goes (gate runs end by alarm, so a shutdown summary would not print)
+                            std::fprintf(stderr, "[gsmtl-hi] postfx class at present %llu:", (unsigned long long)sxPresents);
+                            for (const auto &kv : sxHist)
+                                std::fprintf(stderr, " [%s]=%llu", kv.first.c_str(), (unsigned long long)kv.second);
+                            std::fprintf(stderr, "\n");
+                            std::fflush(stderr);
+                        }
+                        int fx = GSMetalPostFx();
+                        ++sxPrims;
+                        if (fx == 2 && fix != 32u)
+                            fx = 1; // off only for the race/scene trail (FIX 32 = 1/4); anything else (fades) stays blended
+                        if (fx != 0)
+                        {
+                            p.s2 = float(fx);
+                            p.t2 = dy;
+                            static bool s_logged = false;
+                            if (!s_logged && (s_logged = true))
+                                std::fprintf(stderr, "[gsmtl-hi] postfx %s: feedback sprite fbp=%u src=%u field_dy=%.2f rows\n", fx == 1 ? "sharp" : "off",
+                                             ctx.frame.fbp, srcFbp, double(p.t2));
+                        }
+                    }
                 }
                 FillTex(p, state);
             }
@@ -3163,6 +3241,8 @@ void GSMetalBackend::Submit(const GSPrimitiveBatch &batch)
     const GSContext &ctx = batch.state.context;
     const bool rtz = fpcrIsTowardZero(readFpcr());
     m->SelectRun(ctx);
+    if (batch.state.prim.type != GS_PRIM_SPRITE)
+        m->lastOfy[ctx.frame.fbp & 511u] = ctx.xyoffset.ofy; // the scene's (3D) field offset, not HUD/overlay sprites
     uint64_t tTex = 0;
     if (m->ts.on)
     {
@@ -3172,6 +3252,24 @@ void GSMetalBackend::Submit(const GSPrimitiveBatch &batch)
         {
             m->ComputeSpriteGeom(batch);
             prepared = m->TryFbTexture(ctx);
+            {
+                // SX1 research trace: every large sprite (>= 256 px wide) of presents [N, N+2) with its full state
+                static const long sxTrace = std::getenv("PS2X_GS_SX_TRACE") ? std::atol(std::getenv("PS2X_GS_SX_TRACE")) : -1;
+                if (sxTrace >= 0 && m->sxPresents >= uint64_t(sxTrace) && m->sxPresents < uint64_t(sxTrace) + 2u && m->sg.ok &&
+                    m->sg.gx1 - m->sg.gx0 >= 255)
+                {
+                    const auto &v0 = batch.vertices[0], &v1 = batch.vertices[1];
+                    const auto &pr = batch.state.prim;
+                    std::fprintf(stderr, "[sx] p=%llu fbp=%u fbw=%u fpsm=%u fbmsk=%08x zbp=%u | tme=%d abe=%d fst=%d fge=%d | tbp=%u tbw=%u tpsm=%u tw=%u th=%u tcc=%u tfx=%u fbSrc=%d | tex1=%016llx clamp=%016llx alpha=%016llx test=%016llx fba=%llx pabe=%d dthe=%llx colclamp=%llx | xy %.1f,%.1f..%.1f,%.1f ofs %u,%u rect %d,%d..%d,%d | uv %u,%u..%u,%u st %g,%g q %g..%g | rgba %u,%u,%u,%u\n",
+                                 (unsigned long long)m->sxPresents, ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm, ctx.frame.fbmsk, ctx.zbuf.zbp, pr.tme, pr.abe, pr.fst, pr.fge,
+                                 ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, ctx.tex0.tw, ctx.tex0.th, ctx.tex0.tcc, ctx.tex0.tfx, int(m->fbSrc),
+                                 (unsigned long long)ctx.tex1, (unsigned long long)ctx.clamp, (unsigned long long)ctx.alpha, (unsigned long long)ctx.test,
+                                 (unsigned long long)ctx.fba, int(batch.state.pabe), (unsigned long long)batch.state.dthe, (unsigned long long)batch.state.colclamp,
+                                 v0.x, v0.y, v1.x, v1.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy, m->sg.gx0, m->sg.gy0, m->sg.gx1, m->sg.gy1,
+                                 v0.u, v0.v, v1.u, v1.v, v0.s, v0.t, v0.q, v1.q, v1.r, v1.g, v1.b, v1.a);
+                    std::fflush(stderr);
+                }
+            }
             if (!prepared && m->sg.ok && m->TextureOverlapsRun())
             {
                 // The sprite may read pixels it has already written: only the oracle's live VRAM is exact.
@@ -3338,6 +3436,7 @@ PresentationFrame GSMetalBackend::Present(const GSPresentationRequest &request)
     // The display reads the shadow: write the colour planes back once (depth stays on the GPU).
     m->ResolvePlanes(nullptr, true, nullptr, nullptr, kFlushPresent);
     ++m->frame.presents;
+    ++m->sxPresents;
     static const uint32_t s_statsEvery = std::getenv("PS2X_GS_METAL_STATS") ? uint32_t(std::max(1, std::atoi(std::getenv("PS2X_GS_METAL_STATS")))) : 0u;
     if (s_statsEvery && m->frame.presents % s_statsEvery == 0u)
     {

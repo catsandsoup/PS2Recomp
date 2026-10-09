@@ -36,6 +36,7 @@
 id<MTLCommandQueue> GSMetalSharedQueue();
 id<MTLTexture> GSMetalDirectHiTexture(uint64_t key, uint32_t &w, uint32_t &h);
 void GSMetalSetDirectHi(bool on);
+void GSMetalSetPostFx(int mode); // SX1: 0 original, 1 sharp, 2 off (display-only scaled pass)
 bool GSMetalDirectHiOn();
 
 namespace
@@ -52,7 +53,10 @@ namespace
         int scale = 1;          // PS2X_GS_SCALE (applies on next launch)
         bool stretch = false;   // false: 4:3 letterbox
         bool fullscreen = false;
+        bool sharp = false;     // SX1 View > Image: Sharp (PS2X_GS_POSTFX=sharp + sharp-bilinear window filter)
     };
+    bool g_postFxEnv = false;     // PS2X_GS_POSTFX given by the user: env wins over the menu
+    bool g_filterSharpEnv = false, g_filterEnvSet = false; // PS2X_DISPLAY_FILTER=sharp|default
     GraphicsConfig g_cfg;
     int g_activeScale = 1;
 
@@ -129,6 +133,9 @@ namespace
         if (jsonString(s, "aspect", aspect))
             c.stretch = aspect == "stretch";
         jsonBool(s, "fullscreen", c.fullscreen);
+        std::string image;
+        if (jsonString(s, "image", image))
+            c.sharp = image == "sharp";
         g_cfg = c;
     }
 
@@ -144,7 +151,8 @@ namespace
             if (!out)
                 return;
             out << "{\n  \"version\": 1,\n  \"scale\": " << g_cfg.scale << ",\n  \"aspect\": \""
-                << (g_cfg.stretch ? "stretch" : "4:3") << "\",\n  \"fullscreen\": " << (g_cfg.fullscreen ? "true" : "false") << "\n}\n";
+                << (g_cfg.stretch ? "stretch" : "4:3") << "\",\n  \"fullscreen\": " << (g_cfg.fullscreen ? "true" : "false")
+                << ",\n  \"image\": \"" << (g_cfg.sharp ? "sharp" : "original") << "\"\n}\n";
         }
         std::filesystem::rename(tmp, path, ec);
     }
@@ -155,9 +163,17 @@ namespace
     {
         if (!ps2x::shell::sdl3Window() || envOn("PS2X_DETERMINISTIC"))
             return;
+        g_postFxEnv = std::getenv("PS2X_GS_POSTFX") != nullptr;
+        if (const char *f = std::getenv("PS2X_DISPLAY_FILTER"))
+        {
+            g_filterEnvSet = true;
+            g_filterSharpEnv = std::strcmp(f, "sharp") == 0;
+        }
         loadConfig();
         if (!std::getenv("PS2X_GS_SCALE") && g_cfg.scale > 1)
             setenv("PS2X_GS_SCALE", std::to_string(g_cfg.scale).c_str(), 1);
+        if (!g_postFxEnv && g_cfg.sharp)
+            setenv("PS2X_GS_POSTFX", "sharp", 1);
     }
 
     // ---- input snapshot (raylib codes) ----
@@ -232,7 +248,7 @@ namespace
     id<MTLDevice> g_dev = nil;
     id<MTLCommandQueue> g_queue = nil;     // own queue (CPU frames)
     id<MTLCommandQueue> g_gsQueue = nil;   // the Metal backend's queue (direct scaled frames: same-queue ordering)
-    id<MTLRenderPipelineState> g_pso = nil;
+    id<MTLRenderPipelineState> g_pso = nil, g_psoSharp = nil;
     id<MTLSamplerState> g_nearest = nil, g_linear = nil;
     id<MTLTexture> g_frameTex[3] = {nil, nil, nil};
     int g_frameSlot = -1;
@@ -243,6 +259,7 @@ namespace
     uint64_t g_presents = 0, g_hiPresents = 0;
     NSMenuItem *g_scaleItems[4] = {nil, nil, nil, nil};
     NSMenuItem *g_aspectItems[2] = {nil, nil};
+    NSMenuItem *g_imageItems[2] = {nil, nil};
     NSMenuItem *g_fullItem = nil;
     SDL_AudioStream *g_audio = nullptr;
     ps2x::shell::AudioCallback g_audioCb = nullptr;
@@ -264,6 +281,19 @@ fragment float4 fs_blit(VO in [[stage_in]], texture2d<float> t [[texture(0)]], s
 {
     return float4(t.sample(s, in.uv).rgb, 1.0); // GS alpha is not display alpha
 }
+// SX1 sharp-bilinear: nearest inside each source texel, a 1-output-pixel linear ramp at texel edges (scale =
+// output pixels per source texel per axis; <= 1 degenerates to plain bilinear). Linear sampler.
+fragment float4 fs_blit_sharp(VO in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],
+                              constant float2 &scale [[buffer(0)]])
+{
+    const float2 size = float2(t.get_width(), t.get_height());
+    const float2 texel = in.uv * size;
+    const float2 sc = max(scale, float2(1.0));
+    const float2 range = 0.5 - 0.5 / sc;
+    const float2 d = fract(texel) - 0.5;
+    const float2 f = (d - clamp(d, -range, range)) * sc + 0.5;
+    return float4(t.sample(s, (floor(texel) + f) / size).rgb, 1.0);
+}
 )METAL";
 
     void updateMenuState()
@@ -276,6 +306,11 @@ fragment float4 fs_blit(VO in [[stage_in]], texture2d<float> t [[texture(0)]], s
         {
             g_aspectItems[0].state = g_cfg.stretch ? NSControlStateValueOff : NSControlStateValueOn;
             g_aspectItems[1].state = g_cfg.stretch ? NSControlStateValueOn : NSControlStateValueOff;
+        }
+        if (g_imageItems[0])
+        {
+            g_imageItems[0].state = g_cfg.sharp ? NSControlStateValueOff : NSControlStateValueOn;
+            g_imageItems[1].state = g_cfg.sharp ? NSControlStateValueOn : NSControlStateValueOff;
         }
         if (g_fullItem && g_win)
             g_fullItem.state = (SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN) ? NSControlStateValueOn : NSControlStateValueOff;
@@ -330,6 +365,14 @@ fragment float4 fs_blit(VO in [[stage_in]], texture2d<float> t [[texture(0)]], s
 {
     (void)sender;
     toggleFullscreen();
+}
+- (void)setImage:(NSMenuItem *)sender
+{
+    g_cfg.sharp = sender.tag == 1;
+    saveConfig();
+    if (!g_postFxEnv)
+        GSMetalSetPostFx(g_cfg.sharp ? 1 : 0); // live (next recorded frame); the window filter follows on the next present
+    updateMenuState();
 }
 - (void)setAspect:(NSMenuItem *)sender
 {
@@ -405,7 +448,13 @@ namespace
         g_aspectItems[0] = addItem(asp, @"4:3 (original)", @selector(setAspect:), nil, g_menuTarget, 0);
         g_aspectItems[1] = addItem(asp, @"Stretch to Window", @selector(setAspect:), nil, g_menuTarget, 1);
         aspItem.submenu = asp;
+        NSMenuItem *imgItem = [[NSMenuItem alloc] initWithTitle:@"Image" action:nil keyEquivalent:@""];
+        NSMenu *img = [[NSMenu alloc] initWithTitle:@"Image"];
+        g_imageItems[0] = addItem(img, @"Original (PS2 look)", @selector(setImage:), nil, g_menuTarget, 0);
+        g_imageItems[1] = addItem(img, @"Sharp", @selector(setImage:), nil, g_menuTarget, 1);
+        imgItem.submenu = img;
         [view addItem:aspItem];
+        [view addItem:imgItem];
         [view addItem:[NSMenuItem separatorItem]];
         g_fullItem = addItem(view, @"Full Screen", @selector(toggleFull:), @"f", g_menuTarget);
         viewItem.submenu = view;
@@ -472,6 +521,8 @@ namespace
         g_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!g_pso)
             return false;
+        pd.fragmentFunction = [lib newFunctionWithName:@"fs_blit_sharp"];
+        g_psoSharp = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err]; // nil -> plain blit
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
         sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
@@ -584,10 +635,22 @@ namespace
                     }
                 }
                 [enc setViewport:(MTLViewport){vx, vy, vw, vh, 0.0, 1.0}];
-                [enc setRenderPipelineState:g_pso];
                 [enc setVertexBytes:uv length:sizeof(uv) atIndex:0];
                 [enc setFragmentTexture:tex atIndex:0];
-                [enc setFragmentSamplerState:(hi ? g_linear : g_nearest) atIndex:0];
+                const bool sharpFilter = (g_filterEnvSet ? g_filterSharpEnv : g_cfg.sharp) && g_psoSharp;
+                if (sharpFilter)
+                {
+                    // output pixels per source texel on each axis (the drawn sub-rectangle of tex fills the viewport)
+                    const float scale[2] = {float(vw / (double(uv[2]) * double(tex.width))), float(vh / (double(uv[3]) * double(tex.height)))};
+                    [enc setRenderPipelineState:g_psoSharp];
+                    [enc setFragmentBytes:scale length:sizeof(scale) atIndex:0];
+                    [enc setFragmentSamplerState:g_linear atIndex:0];
+                }
+                else
+                {
+                    [enc setRenderPipelineState:g_pso];
+                    [enc setFragmentSamplerState:(hi ? g_linear : g_nearest) atIndex:0];
+                }
                 [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
             }
             [enc endEncoding];
