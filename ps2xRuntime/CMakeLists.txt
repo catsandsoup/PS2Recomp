@@ -446,6 +446,29 @@ if(APPLE)
     # compiled by the C++ compiler as Objective-C++ (enabling the OBJCXX language would also reclassify GLFW's .m files)
     set_source_files_properties(src/lib/gs/gs_metal_backend.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
     target_link_libraries(ps2_runtime PUBLIC "-framework Metal" "-framework Foundation")
+    # MX1: offline metallib. Compiled at build time from the shader source inside gs_metal_backend.mm and
+    # embedded in the binary; the runtime falls back to compiling the source when the metallib is absent,
+    # stale (source hash mismatch) or fails to load. Without the Metal toolchain an empty stub is linked.
+    set(PS2X_GSMTL_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/gsmtl")
+    set(PS2X_GSMTL_CPP "${PS2X_GSMTL_GEN_DIR}/gs_metallib_data.cpp")
+    file(MAKE_DIRECTORY "${PS2X_GSMTL_GEN_DIR}")
+    execute_process(COMMAND xcrun -sdk macosx metal --version RESULT_VARIABLE PS2X_GSMTL_TOOL_RC OUTPUT_QUIET ERROR_QUIET)
+    option(PS2X_GS_METALLIB "Compile the GS Metal shaders to an embedded metallib at build time" ON)
+    if(PS2X_GS_METALLIB AND PS2X_GSMTL_TOOL_RC EQUAL 0)
+        add_custom_command(
+            OUTPUT "${PS2X_GSMTL_CPP}"
+            COMMAND ${CMAKE_COMMAND} "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/gs_metal_backend.mm"
+                    "-DOUT_DIR=${PS2X_GSMTL_GEN_DIR}" "-DOUT_CPP=${PS2X_GSMTL_CPP}" "-DMIN_OS=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gs_metallib.cmake"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/gs_metal_backend.mm" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gs_metallib.cmake"
+            COMMENT "Compiling GS Metal shaders to an embedded metallib"
+            VERBATIM)
+        message(STATUS "GS Metal: build-time metallib ON")
+    else()
+        file(WRITE "${PS2X_GSMTL_CPP}" "// no Metal toolchain at configure time: runtime compiles the shader source\n#include <cstddef>\nextern \"C\" const unsigned char g_gsmtlMetallib[] = {0};\nextern \"C\" const size_t g_gsmtlMetallibSize = 0;\nextern \"C\" const char g_gsmtlMetallibSrcSha256[] = \"\";\n")
+        message(STATUS "GS Metal: build-time metallib OFF (no toolchain or PS2X_GS_METALLIB=OFF); runtime source compile")
+    endif()
+    target_sources(ps2_runtime PRIVATE "${PS2X_GSMTL_CPP}")
 
     # SH1: native macOS shell (PS2X_SHELL=sdl3, opt-in): SDL3 window + CAMetalLayer, gamepads, audio, NSMenu.
     # SDL3 is built STATIC from a pinned release so the packaged .app needs no Homebrew dylibs. Its include

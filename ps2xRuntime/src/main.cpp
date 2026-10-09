@@ -213,6 +213,9 @@ int main(int argc, char *argv[])
         {
             windowTitle += elfName;
         }
+        // MX1: this port's own disc gets its product name as the window title (was "PS2-Recomp | SLES_513.56").
+        if (normalizedId == "SLES-51356")
+            windowTitle = "Road Trip Adventure";
 
         PS2Runtime runtime;
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)

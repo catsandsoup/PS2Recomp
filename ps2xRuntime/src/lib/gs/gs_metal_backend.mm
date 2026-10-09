@@ -37,6 +37,12 @@
 #include <random>
 #include <string>
 #include <unistd.h>
+#include <CommonCrypto/CommonDigest.h>
+
+// MX1: build-time metallib (generated gs_metallib_data.cpp; size 0 when built without the Metal toolchain)
+extern "C" const unsigned char g_gsmtlMetallib[];
+extern "C" const size_t g_gsmtlMetallibSize;
+extern "C" const char g_gsmtlMetallibSrcSha256[];
 #include <unordered_map>
 #include <vector>
 
@@ -2800,6 +2806,20 @@ struct GSMetalBackend::Impl
             x1 = maxX;
             y0 = minY;
             y1 = maxY;
+            // MX1 debug probe: PS2X_GS_HI_PROBE="x,y" logs triangles whose bounds touch 1x pixel (x..x+1, y)
+            static const char *s_probe = std::getenv("PS2X_GS_HI_PROBE");
+            static int s_px = s_probe ? std::atoi(s_probe) : -1, s_py = s_probe && std::strchr(s_probe, ',') ? std::atoi(std::strchr(s_probe, ',') + 1) : -1;
+            static long s_probeLines = 0;
+            if (s_probe && s_probeLines < 20000 && std::min({fx0, fx1, fx2}) <= float(s_px + 2) && std::max({fx0, fx1, fx2}) >= float(s_px - 1) &&
+                std::min({fy0, fy1, fy2}) <= float(s_py + 1) && std::max({fy0, fy1, fy2}) >= float(s_py))
+            {
+                ++s_probeLines;
+                std::fprintf(stderr, "[probe] fbp=%u tme=%d tflags=%#x texdim=%ux%u iip=%d xy=(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f) uv=(%u,%u)(%u,%u)(%u,%u) stq=(%g,%g,%g)(%g,%g,%g)(%g,%g,%g) rgba=%08x,%08x,%08x\n",
+                             ctx.frame.fbp, int(ts.on), p.tflags, p.texdim & 0xFFFFu, p.texdim >> 16, int(state.prim.iip), fx0, fy0, fx1, fy1, fx2, fy2,
+                             p.uv0 & 0xFFFFu, p.uv0 >> 16, p.uv1 & 0xFFFFu, p.uv1 >> 16, p.uv2 & 0xFFFFu, p.uv2 >> 16,
+                             p.s0, p.t0, p.q0, p.s1, p.t1, p.q1, p.s2, p.t2, p.q2, p.rgba0, p.rgba1, p.rgba2);
+                std::fflush(stderr);
+            }
         }
         if (x1 < x0 || y1 < y0)
             return;
@@ -2862,10 +2882,51 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
         }
         NSError *err = nil;
         std::string src = kShaderSource;
-        if (const char *nonce = std::getenv("PS2X_GS_METAL_SHADER_NONCE")) // forces a cold compile (measurement)
+        const char *nonce = std::getenv("PS2X_GS_METAL_SHADER_NONCE"); // forces a cold compile (measurement)
+        if (nonce)
             src += std::string("\n// nonce ") + nonce + "\n";
         const auto tc0 = std::chrono::steady_clock::now();
-        id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()] options:opts error:&err];
+        // MX1: the embedded build-time metallib when it was built from exactly this kShaderSource (SHA-256 match);
+        // otherwise (no toolchain at build time, stale, load failure, PS2X_GS_METAL_METALLIB=0) the runtime source compile.
+        id<MTLLibrary> lib = nil;
+        std::string libKey; // pipeline-archive key: which library the functions come from
+        const char *mlEnv = std::getenv("PS2X_GS_METAL_METALLIB");
+        if (g_gsmtlMetallibSize > 0 && !(mlEnv && std::strcmp(mlEnv, "0") == 0))
+        {
+            unsigned char dg[CC_SHA256_DIGEST_LENGTH];
+            CC_SHA256(kShaderSource, CC_LONG(std::strlen(kShaderSource)), dg);
+            char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+            for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i)
+                std::snprintf(hex + 2 * i, 3, "%02x", dg[i]);
+            if (std::strcmp(hex, g_gsmtlMetallibSrcSha256) == 0)
+            {
+                dispatch_data_t dd = dispatch_data_create(g_gsmtlMetallib, g_gsmtlMetallibSize, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                lib = [device newLibraryWithData:dd error:&err];
+                if (lib)
+                {
+                    // archive key = the metallib bytes (dev and release builds compile the same source to different
+                    // metallibs, e.g. -mmacosx-version-min, and must not share/overwrite one archive)
+                    unsigned char bd[CC_SHA256_DIGEST_LENGTH];
+                    CC_SHA256(g_gsmtlMetallib, CC_LONG(g_gsmtlMetallibSize), bd);
+                    char bh[2 * CC_SHA256_DIGEST_LENGTH + 1];
+                    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i)
+                        std::snprintf(bh + 2 * i, 3, "%02x", bd[i]);
+                    libKey = std::string("metallib ") + bh + (nonce ? std::string(" nonce ") + nonce : std::string());
+                }
+                else
+                    std::fprintf(stderr, "[gsmtl] embedded metallib failed to load (%s); compiling the shader source\n",
+                                 err ? err.localizedDescription.UTF8String : "?");
+            }
+            else
+                std::fprintf(stderr, "[gsmtl] embedded metallib is stale (source hash mismatch); compiling the shader source\n");
+        }
+        const bool fromMetallib = lib != nil;
+        if (!lib)
+        {
+            err = nil;
+            lib = [device newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()] options:opts error:&err];
+            libKey = src;
+        }
         const auto tc1 = std::chrono::steady_clock::now();
         if (!lib)
         {
@@ -2888,7 +2949,7 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
         if (home && !(pc && std::strcmp(pc, "0") == 0))
         {
             uint64_t h = 1469598103934665603ull;
-            for (const char *c : {src.c_str(), device.name.UTF8String})
+            for (const char *c : {libKey.c_str(), device.name.UTF8String})
                 for (; *c; ++c)
                     h = (h ^ uint8_t(*c)) * 1099511628211ull;
             char name[64];
@@ -2906,39 +2967,100 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
                 archive = [device newBinaryArchiveWithDescriptor:ad error:&err];
             }
         }
-        bool archiveHit = false;
-        id<MTLRenderPipelineState> pso = nil;
-        id<MTLComputePipelineState> wbs = nil;
-        if (archive)
+        // Every startup pipeline goes through the archive (G2d main + scatter; MX1 adds the s>1 hi pipelines):
+        // look up with FailOnBinaryArchiveMiss, build misses normally and add them, serialize once if anything was added.
+        const char *scEnv = std::getenv("PS2X_GS_SCALE");
+        const int hiScale = std::min(8, std::max(1, scEnv ? std::atoi(scEnv) : 1));
+        const char *pgEnv = std::getenv("PS2X_GS_PROGRESSIVE");
+        const bool hiProg = pgEnv ? std::atoi(pgEnv) != 0 : hiScale > 1;
+        const bool wantHi = hiScale > 1 || hiProg;
+        MTLRenderPipelineDescriptor *hd = nil;
+        MTLComputePipelineDescriptor *hud = nil, *hpd = nil;
+        if (wantHi)
         {
-            pd.binaryArchives = @[ archive ];
-            cd.binaryArchives = @[ archive ];
-            pso = [device newRenderPipelineStateWithDescriptor:pd options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&err];
-            wbs = [device newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&err];
-            archiveHit = pso && wbs;
+            hd = [MTLRenderPipelineDescriptor new];
+            hd.vertexFunction = pd.vertexFunction;
+            hd.fragmentFunction = [lib newFunctionWithName:@"fs_hi"];
+            hd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Uint;
+            hd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
+            hud = [MTLComputePipelineDescriptor new];
+            hud.computeFunction = [lib newFunctionWithName:@"hi_upscale"];
+            hpd = [MTLComputePipelineDescriptor new];
+            hpd.computeFunction = [lib newFunctionWithName:@"hi_present"];
         }
-        if (!pso)
-            pso = [device newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!wbs)
-            wbs = [device newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionNone reflection:nil error:&err];
-        const auto tc2 = std::chrono::steady_clock::now();
-        if (archive && !archiveHit && pso && wbs)
-        {
-            NSError *aerr = nil;
-            if ([archive addRenderPipelineFunctionsWithDescriptor:pd error:&aerr] &&
-                [archive addComputePipelineFunctionsWithDescriptor:cd error:&aerr])
+        int archiveMisses = 0, archiveAdded = 0;
+        NSError *herr = nil;
+        auto makeRender = [&](MTLRenderPipelineDescriptor *d, NSError **e) -> id<MTLRenderPipelineState> {
+            id<MTLRenderPipelineState> p = nil;
+            if (archive)
             {
-                // temp + rename: concurrent runs never see a half-written archive
-                NSURL *tmp = [NSURL fileURLWithPath:[archiveUrl.path stringByAppendingFormat:@".tmp%d", int(getpid())]];
-                if ([archive serializeToURL:tmp error:&aerr])
-                    std::rename(tmp.path.UTF8String, archiveUrl.path.UTF8String);
-                else
-                    std::remove(tmp.path.UTF8String);
+                d.binaryArchives = @[ archive ];
+                p = [device newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:nil];
             }
+            if (!p)
+            {
+                p = [device newRenderPipelineStateWithDescriptor:d error:e];
+                if (archive)
+                    ++archiveMisses;
+            }
+            return p;
+        };
+        auto makeCompute = [&](MTLComputePipelineDescriptor *d, NSError **e) -> id<MTLComputePipelineState> {
+            id<MTLComputePipelineState> p = nil;
+            if (archive)
+            {
+                d.binaryArchives = @[ archive ];
+                p = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:nil];
+            }
+            if (!p)
+            {
+                p = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:e];
+                if (archive)
+                    ++archiveMisses;
+            }
+            return p;
+        };
+        id<MTLRenderPipelineState> pso = makeRender(pd, &err);
+        id<MTLComputePipelineState> wbs = pso ? makeCompute(cd, &err) : nil;
+        id<MTLRenderPipelineState> hiPso = nil;
+        id<MTLComputePipelineState> hiUp = nil, hiPr = nil;
+        if (pso && wantHi)
+        {
+            hiPso = makeRender(hd, &herr);
+            hiUp = makeCompute(hud, &herr);
+            hiPr = makeCompute(hpd, &herr);
+        }
+        const auto tc2 = std::chrono::steady_clock::now();
+        if (archive && archiveMisses > 0 && pso && wbs)
+        {
+            // Additions to an archive loaded from a URL are not kept by serializeToURL (measured: the s>1 hi pipelines
+            // missed on every launch), so a miss rebuilds a fresh archive holding every pipeline this launch uses.
+            NSError *aerr = nil;
+            MTLBinaryArchiveDescriptor *fd = [MTLBinaryArchiveDescriptor new];
+            id<MTLBinaryArchive> fresh = [device newBinaryArchiveWithDescriptor:fd error:&aerr];
+            if (fresh)
+            {
+                archiveAdded += [fresh addRenderPipelineFunctionsWithDescriptor:pd error:nil] ? 1 : 0;
+                archiveAdded += [fresh addComputePipelineFunctionsWithDescriptor:cd error:nil] ? 1 : 0;
+                if (hiPso && hiUp && hiPr)
+                {
+                    archiveAdded += [fresh addRenderPipelineFunctionsWithDescriptor:hd error:nil] ? 1 : 0;
+                    archiveAdded += [fresh addComputePipelineFunctionsWithDescriptor:hud error:nil] ? 1 : 0;
+                    archiveAdded += [fresh addComputePipelineFunctionsWithDescriptor:hpd error:nil] ? 1 : 0;
+                }
+                archive = fresh;
+            }
+            // temp + rename: concurrent runs never see a half-written archive
+            NSURL *tmp = [NSURL fileURLWithPath:[archiveUrl.path stringByAppendingFormat:@".tmp%d", int(getpid())]];
+            if ([archive serializeToURL:tmp error:&aerr])
+                std::rename(tmp.path.UTF8String, archiveUrl.path.UTF8String);
+            else
+                std::remove(tmp.path.UTF8String);
         }
         const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-        std::fprintf(stderr, "[gsmtl] shaders: library %.1f ms, pipelines %.1f ms (archive %s)\n", ms(tc0, tc1), ms(tc1, tc2),
-                     archive ? (archiveHit ? "hit" : "miss, saved") : "off");
+        std::fprintf(stderr, "[gsmtl] shaders: library %.1f ms (%s), pipelines %.1f ms (archive %s, %d miss, %d saved)\n", ms(tc0, tc1),
+                     fromMetallib ? "metallib" : "source", ms(tc1, tc2), archive ? (archiveMisses ? "miss" : "hit") : "off",
+                     archiveMisses, archiveAdded);
         if (!pso)
         {
             std::fprintf(stderr, "[gsmtl] pipeline failed: %s\n", err.localizedDescription.UTF8String);
@@ -2953,23 +3075,13 @@ std::unique_ptr<GSMetalBackend> GSMetalBackend::Create()
         b->m->wbScatter = wbs;
         b->m->cpuWriteback = std::getenv("PS2X_GS_METAL_CPU_WRITEBACK") != nullptr;
         {
-            const char *sc = std::getenv("PS2X_GS_SCALE");
-            const int scale = std::min(8, std::max(1, sc ? std::atoi(sc) : 1));
-            const char *pg = std::getenv("PS2X_GS_PROGRESSIVE");
-            const bool prog = pg ? std::atoi(pg) != 0 : scale > 1;
-            b->m->hsx = uint32_t(scale);
-            b->m->hsy = uint32_t(scale) * (prog ? 2u : 1u);
+            b->m->hsx = uint32_t(hiScale);
+            b->m->hsy = uint32_t(hiScale) * (hiProg ? 2u : 1u);
             if (b->m->hsx > 1u || b->m->hsy > 1u)
             {
-                NSError *herr = nil;
-                MTLRenderPipelineDescriptor *hd = [MTLRenderPipelineDescriptor new];
-                hd.vertexFunction = pd.vertexFunction;
-                hd.fragmentFunction = [lib newFunctionWithName:@"fs_hi"];
-                hd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Uint;
-                hd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
-                b->m->hiPipeline = [device newRenderPipelineStateWithDescriptor:hd error:&herr];
-                b->m->hiUpscale = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"hi_upscale"] error:&herr];
-                b->m->hiPresent = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"hi_present"] error:&herr];
+                b->m->hiPipeline = hiPso;
+                b->m->hiUpscale = hiUp;
+                b->m->hiPresent = hiPr;
                 b->m->hi = b->m->hiPipeline && b->m->hiUpscale && b->m->hiPresent;
                 g_hiActive.store(b->m->hi, std::memory_order_release);
                 std::fprintf(stderr, "[gsmtl-hi] display scale %ux%u %s%s\n", b->m->hsx, b->m->hsy, b->m->hi ? "on" : "FAILED: ",
