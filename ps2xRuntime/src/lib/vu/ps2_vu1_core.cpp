@@ -919,7 +919,9 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
-    if (m_activeMemory)
+    if (m_packetSink)
+        m_packetSink(m_packetSinkUser, m_xgkick.packet.data(), m_xgkick.totalBytes);
+    else if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
@@ -1833,6 +1835,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    m_lastRunEnded = programEnded;
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }

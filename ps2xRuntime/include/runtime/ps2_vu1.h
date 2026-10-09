@@ -62,6 +62,21 @@ public:
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
 
+    // Hooks used by the native VU1 dispatcher / differential test (ps2_vu1_recomp.cpp).
+    using PacketSink = void (*)(void *user, const uint8_t *data, uint32_t size);
+    void setPacketSink(PacketSink sink, void *user)
+    {
+        m_packetSink = sink;
+        m_packetSinkUser = user;
+    }
+    uint64_t cycleCount() const { return m_cycle; }
+    void setCycleCount(uint64_t cycle)
+    {
+        m_cycle = cycle;
+        m_state.cycles = cycle;
+    }
+    bool lastRunEnded() const { return m_lastRunEnded; }
+
 private:
     enum Pipeline : uint8_t
     {
@@ -239,6 +254,9 @@ private:
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
+    PacketSink m_packetSink = nullptr;
+    void *m_packetSinkUser = nullptr;
+    bool m_lastRunEnded = true;
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,

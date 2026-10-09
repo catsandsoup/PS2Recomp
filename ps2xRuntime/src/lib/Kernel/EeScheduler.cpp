@@ -1,3 +1,4 @@
+#include "hfr_recorder.h"
 #include "runtime/ee_scheduler.h"
 
 #include "ps2_log.h"
@@ -6,6 +7,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
+#include <chrono>
+#include <cstdio>
+#include <string>
 #include <limits>
 #include <stdexcept>
 
@@ -31,7 +36,28 @@ namespace
     constexpr uint32_t WEF_OR = 0x01u;
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
+    // Video timing: PAL = 50 fields/s (20,000 us), NTSC = 59.94 (16,683 us). Chosen once from
+    // PS2X_VIDEO_MODE=PAL|NTSC, else from the boot ELF's region prefix (SLES/SCES/SLED/SCED = PAL).
+    bool palVideoTiming()
+    {
+        static const bool pal = []()
+        {
+            if (const char *mode = std::getenv("PS2X_VIDEO_MODE"); mode && mode[0] != '\0')
+                return mode[0] == 'P' || mode[0] == 'p';
+            const std::string name = PS2Runtime::getIoPaths().elfPath.filename().string();
+            return name.rfind("SLES", 0) == 0 || name.rfind("SCES", 0) == 0 ||
+                   name.rfind("SLED", 0) == 0 || name.rfind("SCED", 0) == 0;
+        }();
+        return pal;
+    }
+    // PS2X_DETERMINISTIC=1: events fire purely on EE cycles (host clock ignored, no sleeping), so a
+    // given input replay produces identical game state per vsync tick and runs as fast as possible.
+    bool deterministicTiming()
+    {
+        static const bool on = std::getenv("PS2X_DETERMINISTIC") != nullptr;
+        return on;
+    }
+    uint64_t vblankPeriodMicroseconds() { return palVideoTiming() ? 20000u : 16683u; }
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
@@ -50,7 +76,8 @@ namespace
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
     }
 
-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+    uint64_t vblankPeriodCycles() { return microsecondsToEeCycles(vblankPeriodMicroseconds()); }
+    std::chrono::microseconds vblankPeriod() { return std::chrono::microseconds(vblankPeriodMicroseconds()); }
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
@@ -146,8 +173,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+    scheduleEvent(m_eeCycle + vblankPeriodCycles(),
+                  std::chrono::steady_clock::now() + vblankPeriod(),
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -1798,7 +1825,7 @@ void EeScheduler::processDueDeadlines()
                 return;
             }
 
-            if (now < pacingDeadline)
+            if (!deterministicTiming() && now < pacingDeadline)
             {
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
@@ -1810,7 +1837,8 @@ void EeScheduler::processDueDeadlines()
                 }
             }
 
-            const auto pacedNow = std::chrono::steady_clock::now();
+            const auto pacedNow = deterministicTiming() ? std::chrono::steady_clock::time_point::max()
+                                                        : std::chrono::steady_clock::now();
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
                                               [this, pacedNow](const ScheduledEvent &item)
                                               { return item.deadlineCycle <= m_eeCycle &&
@@ -1850,8 +1878,14 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                // Never burst missed vblanks after a host stall (that speeds up game time);
+                // re-anchor the host deadline to now when we fall more than two periods behind.
+                auto nextHostDeadline = scheduled.hostDeadline + vblankPeriod();
+                const auto hostNow = std::chrono::steady_clock::now();
+                if (nextHostDeadline + 2 * vblankPeriod() < hostNow)
+                    nextHostDeadline = hostNow + vblankPeriod();
+                scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
+                              nextHostDeadline,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -1867,6 +1901,47 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+    {
+        // PS2X_TRACE_TICKS: per-second game frame rate (DISPFB2 flips) vs vblank rate.
+        static const bool s_traceFps = std::getenv("PS2X_TRACE_TICKS") != nullptr;
+        if (s_traceFps)
+        {
+            using Clock = std::chrono::steady_clock;
+            static Clock::time_point s_window = Clock::now();
+            static uint64_t s_lastDispfb = ~0ull;
+            static uint32_t s_flips = 0u, s_vblanks = 0u;
+            const uint64_t dispfb = m_runtime.memory().gs().dispfb2;
+            if (dispfb != s_lastDispfb)
+            {
+                ++s_flips;
+                s_lastDispfb = dispfb;
+            }
+            ++s_vblanks;
+            const double seconds = std::chrono::duration<double>(Clock::now() - s_window).count();
+            if (seconds >= 2.0)
+            {
+                std::printf("[fps] game=%.1f vblank=%.1f (%s)\n", s_flips / seconds, s_vblanks / seconds,
+                            palVideoTiming() ? "PAL" : "NTSC");
+                s_flips = s_vblanks = 0u;
+                s_window = Clock::now();
+            }
+        }
+        static const char *s_detDumpDir = deterministicTiming() ? std::getenv("PS2X_DUMP_FRAMES") : nullptr;
+        if (s_detDumpDir && s_detDumpDir[0] != '\0')
+        {
+            static const uint32_t s_every = []()
+            {
+                const char *e = std::getenv("PS2X_DUMP_EVERY");
+                const long v = e ? std::strtol(e, nullptr, 10) : 50;
+                return static_cast<uint32_t>(v > 0 ? v : 50);
+            }();
+            if (((m_vsyncTick + 1u) % s_every) == 0u)
+                m_runtime.dumpPresentationFrame(s_detDumpDir, m_vsyncTick + 1u);
+        }
+        // G4b: close the high-frame-rate record of this tick at the same point the det frame dump samples.
+        if (ps2x::hfr::g_on)
+            ps2x::hfr::onVBlank(m_vsyncTick + 1u, m_runtime.memory().gs().dispfb2);
+    }
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
@@ -2036,9 +2111,9 @@ void EeScheduler::waitForEvent()
         }
     }
 
-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
-                                               { return !m_events.empty() ||
-                                                        m_stopRequested.load(std::memory_order_acquire); });
+    const auto pending = [this]()
+    { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); };
+    const bool signaled = deterministicTiming() ? pending() : m_eventCv.wait_until(lock, hostDeadline, pending);
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

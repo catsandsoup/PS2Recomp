@@ -16,7 +16,73 @@ namespace ps2recomp
     {
     }
 
+    namespace
+    {
+        // VU0 macro-mode post-processing classes (opcode numbering per VU0_S1_* / VU0_S2_*).
+        enum class VuPost
+        {
+            None,
+            FmacFd,      // FMAC writing VF[fd]: MAC/status flags, result normalization, VF0 write-protect
+            FmacAcc,     // FMAC writing ACC: MAC/status flags, result normalization
+            RestoreFt,   // non-FMAC write to VF[ft] (ITOF/FTOI/ABS/MOVE/MR32/LQI/LQD/MFIR/RNEXT/RGET)
+            RestoreFd,   // non-FMAC write to VF[fd] (MAX/MINI)
+        };
+
+        VuPost classifyVuPost(const Instruction &inst)
+        {
+            const uint8_t format = inst.rs;
+            if (format == COP2_QMTC2)
+                return VuPost::RestoreFt; // QMTC2 writes VF[rd]; handled specially below
+            if (format < COP2_CO)
+                return VuPost::None;
+            const uint8_t special1 = static_cast<uint8_t>(inst.function & 0x3F);
+            if (special1 < 0x3C)
+            {
+                if (special1 <= 0x0F || (special1 >= 0x18 && special1 <= 0x1C) || special1 == 0x1E ||
+                    (special1 >= 0x20 && special1 <= 0x2A) || special1 == 0x2C || special1 == 0x2D || special1 == 0x2E)
+                    return VuPost::FmacFd;
+                if ((special1 >= 0x10 && special1 <= 0x17) || special1 == 0x1D || special1 == 0x1F ||
+                    special1 == 0x2B || special1 == 0x2F)
+                    return VuPost::RestoreFd;
+                return VuPost::None;
+            }
+            const uint8_t special2 = static_cast<uint8_t>((((inst.raw >> 6) & 0x1F) << 2) | (inst.raw & 0x3));
+            if (special2 <= 0x0F || (special2 >= 0x18 && special2 <= 0x1C) || special2 == 0x1E ||
+                (special2 >= 0x20 && special2 <= 0x2A) || special2 == 0x2C || special2 == 0x2D || special2 == 0x2E)
+                return VuPost::FmacAcc;
+            if ((special2 >= 0x10 && special2 <= 0x17) || special2 == 0x1D || special2 == 0x30 || special2 == 0x31 ||
+                special2 == 0x34 || special2 == 0x36 || special2 == 0x3D || special2 == 0x40 || special2 == 0x41)
+                return VuPost::RestoreFt;
+            return VuPost::None;
+        }
+    }
+
+    // Wraps the per-op translation with the architectural side effects every VU0 macro op shares:
+    // FMAC ops update MAC/status flags and normalize their result (ps2_vu0_fmac_commit), and VF0 stays
+    // (0,0,0,1) whatever an instruction writes to it.
     std::string VuTranslator::translate(const Instruction &inst)
+    {
+        std::string code = translateRaw(inst);
+        const uint8_t dest = inst.vectorInfo.vectorField & 0xF;
+        switch (classifyVuPost(inst))
+        {
+        case VuPost::FmacFd:
+            return fmt::format("{{ {} ps2_vu0_fmac_commit(ctx, {}, {}u); }}", code, inst.sa, dest);
+        case VuPost::FmacAcc:
+            return fmt::format("{{ {} ps2_vu0_fmac_commit(ctx, 32, {}u); }}", code, dest);
+        case VuPost::RestoreFd:
+            return inst.sa == 0 ? fmt::format("{{ {} ps2_vu0_restore_vf0(ctx); }}", code) : code;
+        case VuPost::RestoreFt:
+        {
+            const uint8_t target = inst.rs == COP2_QMTC2 ? inst.rd : inst.rt;
+            return target == 0 ? fmt::format("{{ {} ps2_vu0_restore_vf0(ctx); }}", code) : code;
+        }
+        default:
+            return code;
+        }
+    }
+
+    std::string VuTranslator::translateRaw(const Instruction &inst)
     {
         uint8_t format = inst.rs; // Use parsed rs field for COP2 format
         uint8_t rt = inst.rt;
@@ -60,7 +126,8 @@ namespace ps2recomp
             case VU0_CR_CMSAR1:
                 return fmt::format("SET_GPR_U32(ctx, {}, ctx->vu0_cmsar1);", rt);
             default:
-                return fmt::format("// Unimplemented CFC2 VU control register: {}", rd);
+                // reserved control registers read as zero (PCSX2 VU0.VI[] of an unused register is 0)
+                return fmt::format("SET_GPR_U32(ctx, {}, 0u); // CFC2 reserved VU control register {}", rt, rd);
             }
         }
         case COP2_QMTC2:
@@ -79,7 +146,8 @@ namespace ps2recomp
             switch (rd)
             {
             case VU0_CR_STATUS:
-                return fmt::format("ctx->vu0_status = static_cast<uint16_t>(GPR_U32(ctx, {}) & 0xFFFFu);", rt);
+                // Only the sticky bits 6..11 are writable (VU User's Manual p.201; microVU_Macro ctc2).
+                return fmt::format("ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0x3Fu) | (GPR_U32(ctx, {}) & 0xFC0u));", rt);
             case VU0_CR_MAC:
             case VU0_CR_TPC:
             case VU0_CR_VPU_STAT:
@@ -262,24 +330,7 @@ namespace ps2recomp
                         inst.rt, inst.rt);
                 }
                 case VU0_S2_VCLIPw:
-                {
-                    uint8_t field = inst.function & 0x3;
-                    std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
-
-                    return fmt::format(
-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
-                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
-                        inst.rd, inst.rt, inst.rt, shuffle_pattern);
-                }
+                    return fmt::format("ps2_vu0_clip(ctx, {}, {});", inst.rd, inst.rt);
                 case VU0_S2_VNOP:
                     return fmt::format("// NOP operation, no action needed for VU0");
                 case VU0_S2_VRNEXT:

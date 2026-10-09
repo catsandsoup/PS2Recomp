@@ -10,6 +10,10 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VITASDK})
 endif()
 
 project(PS2RetroX)
+if(APPLE)
+    # SH1: SDL3 (FetchContent, ps2xRuntime) compiles Objective-C sources; the language must be enabled at the top level.
+    enable_language(OBJC)
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

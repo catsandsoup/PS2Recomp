@@ -1,5 +1,15 @@
+#include <chrono>
+#include <cstdlib>
+#include <cstdio>
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_threaded_backend.h"
+#include "runtime/gs/gs_census_backend.h"
+#if defined(__APPLE__)
+#include "runtime/gs/gs_metal_backend.h"
+#include "runtime/gs/gs_tee_backend.h"
+#endif
+#include <string>
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -105,8 +115,62 @@ namespace
 }
 
 
+namespace
+{
+    // PS2X_GS_BACKEND=metal | cpu | tee (Metal plan M1/M8). Unset or empty: Metal on macOS when the
+    // Metal device initialises (G2f, M8), else the CPU backend. cpu keeps the CPU reference backend
+    // (frames are byte-identical across backends). Metal and tee are macOS only and fall back to
+    // the CPU backend, with a log line, when no Metal device is available.
+    std::unique_ptr<GSRasterBackend> makeInnerRasterBackend()
+    {
+        const char *sel = std::getenv("PS2X_GS_BACKEND");
+#if defined(__APPLE__)
+        const std::string which = (sel && *sel) ? sel : "metal";
+#else
+        const std::string which = (sel && *sel) ? sel : "cpu";
+#endif
+        if (which == "cpu")
+            return std::make_unique<GSCpuBackend>();
+#if defined(__APPLE__)
+        if (which == "metal" || which == "tee")
+        {
+            std::unique_ptr<GSMetalBackend> metal = GSMetalBackend::Create();
+            if (metal)
+            {
+                if (which == "tee")
+                    return std::make_unique<GSTeeBackend>(std::make_unique<GSCpuBackend>(), std::move(metal));
+                if (const char *v = std::getenv("PS2X_GS_METAL_SELFTEST"))
+                    metal->SelfTest(static_cast<uint32_t>(std::max(1024, std::atoi(v))));
+                if (const char *dv = std::getenv("PS2X_GS_METAL_SELFTEST_DRAWS"))
+                    metal->SelfTestDraws(static_cast<uint32_t>(std::max(1, std::atoi(dv))),
+                                         std::getenv("PS2X_GS_METAL_SELFTEST_SEED") ? static_cast<uint32_t>(std::atoi(std::getenv("PS2X_GS_METAL_SELFTEST_SEED"))) : 1u);
+                return metal;
+            }
+            std::fprintf(stderr, "[gs] %s backend%s unavailable (Metal init failed); using the CPU backend\n",
+                         which.c_str(), (sel && *sel) ? "" : " (default)");
+            return std::make_unique<GSCpuBackend>();
+        }
+#endif
+        std::fprintf(stderr, "[gs] unknown PS2X_GS_BACKEND=%s; using the CPU backend\n", which.c_str());
+        return std::make_unique<GSCpuBackend>();
+    }
+}
+
+std::unique_ptr<GSRasterBackend> GS::makeDefaultRasterBackend()
+{
+    // PS2X_GS_THREAD=1 (default): rasterise on a dedicated GS thread (GSThreadedBackend).
+    // PS2X_GS_THREAD=0: the synchronous backend on the caller's thread.
+    // PS2X_GS_CENSUS=<file>: count-only census wrapper around the raster backend (Metal plan M0).
+    std::unique_ptr<GSRasterBackend> inner = makeInnerRasterBackend();
+    if (const char *census = GSCensusBackend::PathFromEnvironment())
+        inner = std::make_unique<GSCensusBackend>(std::move(inner), census);
+    if (GSThreadedBackend::EnabledByEnvironment())
+        return std::make_unique<GSThreadedBackend>(std::move(inner));
+    return inner;
+}
+
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(makeDefaultRasterBackend())
 {
     reset();
 }
@@ -116,9 +180,12 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
-    if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
-    m_backend->Initialize(vram, vramSize);
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        if (!m_backend)
+            m_backend = makeDefaultRasterBackend();
+        m_backend->Initialize(vram, vramSize);
+    }
     reset();
 }
 
@@ -154,6 +221,8 @@ void GS::reset()
     m_trxpos = {};
     m_trxreg = {};
     m_trxdir = 3;
+    m_debugTransferDirection = 3u;
+    m_debugTransferTotalPixels = 0u;
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_preferredDisplaySourceFrame = {};
@@ -174,6 +243,7 @@ void GS::reset()
         m_hostPresentationSourceFbp = 0u;
         m_hostPresentationUsedPreferred = false;
         m_hasHostPresentationFrame = false;
+        m_pendingPresentDebugEvents.clear();
     }
 
     m_debugHistoryWrite = 0;
@@ -197,9 +267,10 @@ GSContext &GS::activeContext()
 
 void GS::snapshotVRAM()
 {
-    // Presentation/debug snapshots run outside m_stateMutex so the EE can keep
-    // feeding the GS while a backend performs host-side conversion. Keep the
-    // selected backend alive and unswappable for the duration of the call.
+    // Every backend call is made under m_stateMutex: the threaded backend relies on the
+    // frontend to serialise its producer side (a drain publishes the producer's chunk).
+    // Lock order: m_stateMutex, then m_backendLifetimeMutex.
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
     if (!m_backend)
         return;
@@ -314,9 +385,10 @@ GSDebugHistoryEntry GS::makeDebugEventUnlocked(GSDebugEventKind kind) const
     entry.bitbltbuf = m_bitbltbuf;
     entry.trxpos = m_trxpos;
     entry.trxreg = m_trxreg;
-    const GSTransferSnapshot transfer = m_backend ? m_backend->GetTransferSnapshot() : GSTransferSnapshot{};
-    entry.trxdir = transfer.direction;
-    entry.transferPixels = transfer.totalPixels;
+    // Mirror of the backend's transfer state (set at TRXDIR exactly as BeginTransfer sets it),
+    // so recording debug history never waits for the GS thread.
+    entry.trxdir = m_debugTransferDirection;
+    entry.transferPixels = m_debugTransferTotalPixels;
     return entry;
 }
 
@@ -453,7 +525,7 @@ void GS::recordTransferDebugEventUnlocked()
     }
 
     GSDebugHistoryEntry entry = makeDebugEventUnlocked(GSDebugEventKind::Transfer);
-    entry.transferPixels = m_backend ? m_backend->GetTransferSnapshot().totalPixels : 0u;
+    entry.transferPixels = m_debugTransferTotalPixels;
     recordDebugEventUnlocked(entry);
 }
 
@@ -524,6 +596,83 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
+void GS::deliverHostPresentationFrame(PresentationFrame &&frame, HostFrameCapture *capture)
+{
+    // Runs on the GS thread for the threaded backend: only the leaf m_presentationMutex
+    // may be taken here (the producer can block on backpressure while holding m_stateMutex).
+    const bool hasFrame = static_cast<bool>(frame);
+    {
+        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        if (capture)
+        {
+            capture->ok = hasFrame && packHostFrame(frame.pixels, frame.width, frame.height, capture->pixels);
+            capture->width = capture->ok ? frame.width : 0u;
+            capture->height = capture->ok ? frame.height : 0u;
+        }
+        m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationWidth = frame.width;
+        m_hostPresentationHeight = frame.height;
+        m_hostPresentationDisplayFbp = frame.displayFbp;
+        m_hostPresentationSourceFbp = frame.sourceFbp;
+        m_hostPresentationUsedPreferred = frame.usedPreferred;
+        m_hasHostPresentationFrame = hasFrame;
+        if (hasFrame && m_pendingPresentDebugEvents.size() < 64u)
+            m_pendingPresentDebugEvents.push_back({frame.displayFbp, frame.sourceFbp, frame.width, frame.height, frame.usedPreferred});
+    }
+    m_hostPresentationSerial.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+void GS::flushPendingPresentDebugEventsUnlocked()
+{
+    std::vector<PendingPresentDebugEvent> events;
+    {
+        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        if (m_pendingPresentDebugEvents.empty())
+            return;
+        events.swap(m_pendingPresentDebugEvents);
+    }
+    for (const PendingPresentDebugEvent &e : events)
+        recordPresentDebugEventUnlocked(e.displayFbp, e.sourceFbp, e.width, e.height, e.usedPreferred);
+}
+
+bool GS::latchHostPresentationFrameAndCopy(std::vector<uint8_t> &outPixels, uint32_t &outWidth, uint32_t &outHeight)
+{
+    std::shared_ptr<HostFrameCapture> capture;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        if (m_backend && m_privRegs)
+        {
+            const GSPresentationRequest request = buildPresentationRequestUnlocked();
+            flushPendingPresentDebugEventsUnlocked();
+            capture = std::make_shared<HostFrameCapture>();
+            auto done = [this, capture](PresentationFrame &&frame)
+            { deliverHostPresentationFrame(std::move(frame), capture.get()); };
+            if (m_backend->PresentAsync(request, std::move(done)))
+            {
+                // Frame dumps need this exact frame: wait for the GS thread to deliver it.
+                m_backend->Sync(GSSyncReason::DebugReadback);
+                std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+                outPixels = std::move(capture->pixels);
+                outWidth = capture->width;
+                outHeight = capture->height;
+                return capture->ok;
+            }
+        }
+    }
+    latchHostPresentationFrame();
+    return copyLatchedHostPresentationFrame(outPixels, outWidth, outHeight);
+}
+
+void GS::waitForRasterIdle()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_backend)
+    {
+        m_backend->Flush();
+        m_backend->Sync(GSSyncReason::DebugReadback);
+    }
+}
+
 void GS::latchHostPresentationFrame()
 {
     GSPresentationRequest request{};
@@ -538,6 +687,14 @@ void GS::latchHostPresentationFrame()
             return;
         }
         request = buildPresentationRequestUnlocked();
+        // Threaded backend: queue the present in stream order behind every earlier command and
+        // return; the GS thread fills the mailbox and bumps m_hostPresentationSerial when the
+        // frame exists. Enqueued under m_stateMutex so presents from any thread are ordered.
+        flushPendingPresentDebugEventsUnlocked();
+        auto done = [this](PresentationFrame &&frame)
+        { deliverHostPresentationFrame(std::move(frame), nullptr); };
+        if (m_backend->PresentAsync(request, std::move(done)))
+            return;
     }
 
     PresentationFrame frame{};
@@ -567,12 +724,33 @@ void GS::latchHostPresentationFrame()
         m_hostPresentationUsedPreferred = usedPreferred;
         m_hasHostPresentationFrame = hasFrame;
     }
+    m_hostPresentationSerial.fetch_add(1u, std::memory_order_acq_rel);
 
     if (hasFrame)
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
     }
+}
+
+bool GS::packHostFrame(const std::vector<uint8_t> &src, uint32_t width, uint32_t height, std::vector<uint8_t> &outPixels)
+{
+    // Same row repacking as copyLatchedHostPresentationFrame (source rows are kHostFrameWidth wide).
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u;
+    outPixels.resize(packedRowBytes * static_cast<size_t>(height));
+    const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+    for (uint32_t y = 0; y < height; ++y)
+    {
+        const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
+        const size_t dstOffset = static_cast<size_t>(y) * packedRowBytes;
+        if (srcOffset + packedRowBytes > src.size() || dstOffset + packedRowBytes > outPixels.size())
+        {
+            outPixels.clear();
+            return false;
+        }
+        std::memcpy(outPixels.data() + dstOffset, src.data() + srcOffset, packedRowBytes);
+    }
+    return true;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -875,6 +1053,35 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
     return true;
 }
 
+extern thread_local uint8_t g_gifCurrentPath;
+static const std::chrono::steady_clock::time_point g_gsVertexTraceProcessStart = std::chrono::steady_clock::now();
+
+namespace
+{
+    // PS2X_TRACE_VERTS=<seconds>: append every packed XYZ vertex in a 0.3 s window starting
+    // <seconds> after the first vertex to $PS2X_TRACE_VERTS_FILE (default /tmp/ps2x_verts.txt).
+    void traceVertex(uint16_t x, uint16_t y, uint32_t z, bool adk, uint32_t prim, uint64_t ofs, uint32_t rgba, float q)
+    {
+        static const char *s_start = std::getenv("PS2X_TRACE_VERTS");
+        if (!s_start)
+            return;
+        using Clock = std::chrono::steady_clock;
+        static const double s_begin = std::atof(s_start);
+        const double t = std::chrono::duration<double>(Clock::now() - g_gsVertexTraceProcessStart).count();
+        if (t < s_begin || t > s_begin + 0.4)
+            return;
+        static FILE *s_file = []()
+        {
+            const char *path = std::getenv("PS2X_TRACE_VERTS_FILE");
+            return std::fopen(path ? path : "/tmp/ps2x_verts.txt", "w");
+        }();
+        if (s_file)
+            std::fprintf(s_file, "%.4f %u %u %u %d %u %llx %08x %g path%u\n", t, x, y, z, adk ? 1 : 0, prim, (unsigned long long)ofs, rgba, q, g_gifCurrentPath);
+        if (s_file)
+            std::fflush(s_file);
+    }
+}
+
 void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 {
     switch (regDesc)
@@ -910,7 +1117,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         uint16_t y = static_cast<uint16_t>((lo >> 32) & 0xFFFF);
         uint32_t z = static_cast<uint32_t>((hi >> 4) & 0xFFFFFF);
         uint8_t f = static_cast<uint8_t>((hi >> 36) & 0xFF);
-        bool adk = ((hi >> 47) & 1) != 0;
+        static const bool s_debugIgnoreAdc = std::getenv("PS2X_DEBUG_IGNORE_ADC") != nullptr;
+        bool adk = !s_debugIgnoreAdc && ((hi >> 47) & 1) != 0;
+        traceVertex(x, y, z, adk, m_prim.type, (uint64_t(m_ctx[m_prim.ctxt ? 1 : 0].xyoffset.ofy) << 32) | m_ctx[m_prim.ctxt ? 1 : 0].xyoffset.ofx, (uint32_t(m_curA) << 24) | (uint32_t(m_curB) << 16) | (uint32_t(m_curG) << 8) | m_curR, m_curQ);
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
             if (debugIndex < 64u)
@@ -948,7 +1157,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         uint16_t x = static_cast<uint16_t>(lo & 0xFFFF);
         uint16_t y = static_cast<uint16_t>((lo >> 32) & 0xFFFF);
         uint32_t z = static_cast<uint32_t>(hi & 0xFFFFFFFF);
-        bool adk = ((hi >> 47) & 1) != 0;
+        static const bool s_debugIgnoreAdc = std::getenv("PS2X_DEBUG_IGNORE_ADC") != nullptr;
+        bool adk = !s_debugIgnoreAdc && ((hi >> 47) & 1) != 0;
+        traceVertex(x, y, static_cast<uint32_t>(hi & 0xFFFFFFFF), adk, m_prim.type, (uint64_t(m_ctx[m_prim.ctxt ? 1 : 0].xyoffset.ofy) << 32) | m_ctx[m_prim.ctxt ? 1 : 0].xyoffset.ofx, (uint32_t(m_curA) << 24) | (uint32_t(m_curB) << 16) | (uint32_t(m_curG) << 8) | m_curR, m_curQ);
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
             if (debugIndex < 64u)
@@ -1383,6 +1594,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        m_debugTransferDirection = m_trxdir;
+        m_debugTransferTotalPixels = static_cast<uint32_t>(m_trxreg.rrw) * static_cast<uint32_t>(m_trxreg.rrh);
 
         if (m_backend)
         {
@@ -1524,8 +1737,12 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     recordRegisterDebugEventUnlocked(regAddr, value);
 }
 
+std::atomic<uint32_t> g_gsDrawKicksByFbp[512];
+
 void GS::vertexKick(bool drawing)
 {
+    if (drawing)
+        g_gsDrawKicksByFbp[m_ctx[m_prim.ctxt ? 1 : 0].frame.fbp & 0x1FFu].fetch_add(1u, std::memory_order_relaxed);
     ++m_vtxCount;
     ++m_vtxIndex;
 
@@ -1635,7 +1852,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
     if (!backend)
-        backend = std::make_unique<GSCpuBackend>();
+        backend = makeDefaultRasterBackend();
 
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
@@ -1657,8 +1874,10 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
         }
     }
 
-    m_backend = std::move(backend);
+    m_backend = std::move(backend); // destroying a GSThreadedBackend joins its thread
     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
+    m_debugTransferDirection = 3u;
+    m_debugTransferTotalPixels = 0u;
 }
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const

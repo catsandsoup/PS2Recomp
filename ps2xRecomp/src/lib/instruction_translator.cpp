@@ -76,11 +76,12 @@ namespace ps2recomp
     std::string InstructionTranslator::translateMemoryRead(const Instruction &inst,
                                                            const MemoryAccessHint &memoryHint,
                                                            int width,
-                                                           const std::string &addr) const
+                                                           const std::string &addr_) const
     {
+        const std::string addr = (width == 128) ? fmt::format("(({}) & ~0xFu)", addr_) : addr_;
         if (memoryHint.hasAddress)
         {
-            const uint32_t resolvedAddress = memoryHint.address;
+            const uint32_t resolvedAddress = (width == 128) ? (memoryHint.address & ~0xFu) : memoryHint.address;
             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
             if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
             {
@@ -99,12 +100,13 @@ namespace ps2recomp
     std::string InstructionTranslator::translateMemoryWrite(const Instruction &inst,
                                                             const MemoryAccessHint &memoryHint,
                                                             int width,
-                                                            const std::string &addr,
+                                                            const std::string &addr_,
                                                             const std::string &value) const
     {
+        const std::string addr = (width == 128) ? fmt::format("(({}) & ~0xFu)", addr_) : addr_;
         if (memoryHint.hasAddress)
         {
-            const uint32_t resolvedAddress = memoryHint.address;
+            const uint32_t resolvedAddress = (width == 128) ? (memoryHint.address & ~0xFu) : memoryHint.address;
             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
             if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
             {
@@ -211,6 +213,8 @@ namespace ps2recomp
                 inst.rt,
                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
         case OPCODE_LDC2:
+            if (inst.rt == 0) // VF0 is hard-wired to (0,0,0,1): the load happens, the value is discarded
+                return fmt::format("(void){};", genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
             return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
         case OPCODE_SDC2:
             return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";

@@ -388,6 +388,8 @@ public:
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
     void requestStop();
+    // Latch the current GS display output and write it as <dir>/frame_<tick>.png (deterministic test dumps).
+    void dumpPresentationFrame(const char *dir, uint64_t tick);
     bool isStopRequested() const;
 
     EeScheduler &eeScheduler();

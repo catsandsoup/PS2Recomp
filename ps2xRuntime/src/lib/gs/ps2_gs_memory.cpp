@@ -192,14 +192,14 @@ namespace GSMem
     }};
 
     // this is going to be massive (an entire page of addess lookups)
-    static C32PageLookupTable  PageTableC32{ };
-    static Z32PageLookupTableT PageTableZ32{ };
-    static C16PageLookupTable  PageTableC16{ };
-    static C16SPageLookupTable PageTableC16S{ };
-    static Z16PageLookupTable  PageTableZ16{ };
-    static Z16SPageLookupTable PageTableZ16S{ };
-    static P8PageLookupTable   PageTableP8{ };
-    static P4PageLookupTable   PageTableP4{ };
+    C32PageLookupTable  PageTableC32{ };
+    Z32PageLookupTableT PageTableZ32{ };
+    C16PageLookupTable  PageTableC16{ };
+    C16SPageLookupTable PageTableC16S{ };
+    Z16PageLookupTable  PageTableZ16{ };
+    Z16SPageLookupTable PageTableZ16S{ };
+    P8PageLookupTable   PageTableP8{ };
+    P4PageLookupTable   PageTableP4{ };
 
     void InitLookupTables()
     {
@@ -218,41 +218,6 @@ namespace GSMem
 
         // 4 bit
         PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
-    }
-
-    u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
-    {
-        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
-        {
-        case C32:
-            return PixelStorageTraits<C32>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case C24:
-            return PixelStorageTraits<C24>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case C16:
-            return PixelStorageTraits<C16>::Read(PageTableC16, data, bp, bw, x, y, &cache);
-        case C16S:
-            return PixelStorageTraits<C16S>::Read(PageTableC16S, data, bp, bw, x, y, &cache);
-        case P8:
-            return PixelStorageTraits<P8>::Read(PageTableP8, data, bp, bw, x, y, &cache);
-        case P4:
-            return PixelStorageTraits<P4>::Read(PageTableP4, data, bp, bw, x, y, &cache);
-        case P8H:
-            return PixelStorageTraits<P8H>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case P4HL:
-            return PixelStorageTraits<P4HL>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case P4HH:
-            return PixelStorageTraits<P4HH>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case Z32:
-            return PixelStorageTraits<Z32>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
-        case Z24:
-            return PixelStorageTraits<Z24>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
-        case Z16:
-            return PixelStorageTraits<Z16>::Read(PageTableZ16, data, bp, bw, x, y, &cache);
-        case Z16S:
-            return PixelStorageTraits<Z16S>::Read(PageTableZ16S, data, bp, bw, x, y, &cache);
-        default:
-            return 0u;
-        }
     }
 
     void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)

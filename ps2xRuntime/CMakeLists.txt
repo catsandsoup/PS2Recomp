@@ -383,6 +383,8 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_threaded_backend.cpp
+    src/lib/gs/gs_census_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -393,7 +395,10 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
+    src/lib/vu/ps2_vu1_recomp.cpp
     src/lib/games_database.cpp
+    src/lib/ps2_call_trace.cpp
+    src/lib/ps2_disc_setup.cpp
 )
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -401,6 +406,9 @@ if(PS2X_ENABLE_RUNTIME_LOGS)
         PS2_RUNTIME_LOGS=1
     )
 endif()
+
+# Game hooks (entry/exit hooks by guest address) and the GOALS Q5 starting-car chooser.
+target_sources(ps2_runtime PRIVATE src/lib/game_hooks.cpp src/lib/starter_car.cpp src/lib/hfr_recorder.cpp)
 
 if(PS2X_ENABLE_AGRESSIVE_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
@@ -429,6 +437,69 @@ target_compile_definitions(ps2_runtime PRIVATE
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
 )
 
+# Metal GS backend (Metal plan M1): Objective-C++, macOS only. PS2X_GS_BACKEND=metal|tee selects it.
+if(APPLE)
+    target_sources(ps2_runtime PRIVATE
+        src/lib/gs/gs_metal_backend.mm
+        src/lib/gs/gs_tee_backend.cpp
+    )
+    # compiled by the C++ compiler as Objective-C++ (enabling the OBJCXX language would also reclassify GLFW's .m files)
+    set_source_files_properties(src/lib/gs/gs_metal_backend.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+    target_link_libraries(ps2_runtime PUBLIC "-framework Metal" "-framework Foundation")
+    # MX1: offline metallib. Compiled at build time from the shader source inside gs_metal_backend.mm and
+    # embedded in the binary; the runtime falls back to compiling the source when the metallib is absent,
+    # stale (source hash mismatch) or fails to load. Without the Metal toolchain an empty stub is linked.
+    set(PS2X_GSMTL_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/gsmtl")
+    set(PS2X_GSMTL_CPP "${PS2X_GSMTL_GEN_DIR}/gs_metallib_data.cpp")
+    file(MAKE_DIRECTORY "${PS2X_GSMTL_GEN_DIR}")
+    execute_process(COMMAND xcrun -sdk macosx metal --version RESULT_VARIABLE PS2X_GSMTL_TOOL_RC OUTPUT_QUIET ERROR_QUIET)
+    option(PS2X_GS_METALLIB "Compile the GS Metal shaders to an embedded metallib at build time" ON)
+    if(PS2X_GS_METALLIB AND PS2X_GSMTL_TOOL_RC EQUAL 0)
+        add_custom_command(
+            OUTPUT "${PS2X_GSMTL_CPP}"
+            COMMAND ${CMAKE_COMMAND} "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/gs_metal_backend.mm"
+                    "-DOUT_DIR=${PS2X_GSMTL_GEN_DIR}" "-DOUT_CPP=${PS2X_GSMTL_CPP}" "-DMIN_OS=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gs_metallib.cmake"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/gs_metal_backend.mm" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gs_metallib.cmake"
+            COMMENT "Compiling GS Metal shaders to an embedded metallib"
+            VERBATIM)
+        message(STATUS "GS Metal: build-time metallib ON")
+    else()
+        file(WRITE "${PS2X_GSMTL_CPP}" "// no Metal toolchain at configure time: runtime compiles the shader source\n#include <cstddef>\nextern \"C\" const unsigned char g_gsmtlMetallib[] = {0};\nextern \"C\" const size_t g_gsmtlMetallibSize = 0;\nextern \"C\" const char g_gsmtlMetallibSrcSha256[] = \"\";\n")
+        message(STATUS "GS Metal: build-time metallib OFF (no toolchain or PS2X_GS_METALLIB=OFF); runtime source compile")
+    endif()
+    target_sources(ps2_runtime PRIVATE "${PS2X_GSMTL_CPP}")
+
+    # SH1: native macOS shell (PS2X_SHELL=sdl3, opt-in): SDL3 window + CAMetalLayer, gamepads, audio, NSMenu.
+    # SDL3 is built STATIC from a pinned release so the packaged .app needs no Homebrew dylibs. Its include
+    # directory is set on the shell source only, so no other runtime or generated unit changes its flags.
+    if(NOT PS2X_IS_ANDROID)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+        set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            SDL3
+            GIT_REPOSITORY "https://github.com/libsdl-org/SDL.git"
+            GIT_TAG "release-3.2.30"
+            GIT_SHALLOW TRUE
+            GIT_PROGRESS TRUE
+        )
+        FetchContent_MakeAvailable(SDL3)
+        target_sources(ps2_runtime PRIVATE src/lib/ps2_shell_sdl3.mm)
+        # PK1: first-run disc picker (child process; AppKit only)
+        target_sources(ps2_runtime PRIVATE src/lib/ps2_disc_picker_mac.mm)
+        set_source_files_properties(src/lib/ps2_disc_picker_mac.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+        target_link_libraries(ps2_runtime PUBLIC "-framework UniformTypeIdentifiers")
+        set_source_files_properties(src/lib/ps2_shell_sdl3.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
+            INCLUDE_DIRECTORIES "$<TARGET_PROPERTY:SDL3::SDL3-static,INTERFACE_INCLUDE_DIRECTORIES>")
+        target_link_libraries(ps2_runtime PRIVATE $<LINK_ONLY:SDL3::SDL3-static>)
+        target_link_libraries(ps2_runtime PUBLIC "-framework QuartzCore" "-framework AppKit")
+    endif()
+endif()
+
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
 )
@@ -437,8 +508,10 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
+set(PS2X_RUNNER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner" CACHE PATH "Directory holding generated recompiled sources and headers")
+
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+    "${PS2X_RUNNER_DIR}/*.cpp"
 )
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
@@ -476,8 +549,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_RUNNER_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_RUNNER_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -489,6 +562,51 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})
+endif()
+
+target_include_directories(ps2EntryRunner PRIVATE "${PS2X_RUNNER_DIR}")
+
+# ---------------------------------------------------------------------------
+# Statically recompiled VU1 microprograms (game/tools/vu1recomp).
+#   PS2X_VU1_CATALOG_DIR : VU1 catalog captured with PS2X_VU1_CATALOG=<dir>
+#                          (index.txt + <hash>.vu1).  When set, the generator
+#                          runs at configure time and re-runs whenever the
+#                          catalog index or the generator changes.
+#   PS2X_VU1_GENERATOR   : path to vu1recomp.py
+#   PS2X_VU1GEN_DIR      : output dir for generated vu1rec_<hash>.cpp; every
+#                          such file present is compiled into ps2EntryRunner.
+# Generated code is derived from disc data: keep PS2X_VU1GEN_DIR out of git.
+# ---------------------------------------------------------------------------
+set(PS2X_VU1_CATALOG_DIR "" CACHE PATH "VU1 catalog directory (index.txt + <hash>.vu1) for the VU1 static recompiler")
+set(PS2X_VU1_GENERATOR "" CACHE FILEPATH "Path to vu1recomp.py")
+set(PS2X_VU1GEN_DIR "" CACHE PATH "Directory holding generated VU1 microprogram C++ (vu1rec_*.cpp)")
+if(PS2X_VU1GEN_DIR)
+    if(PS2X_VU1_CATALOG_DIR AND PS2X_VU1_GENERATOR AND EXISTS "${PS2X_VU1_CATALOG_DIR}/index.txt")
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        get_filename_component(PS2X_VU1_GENERATOR_DIR "${PS2X_VU1_GENERATOR}" DIRECTORY)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" "${PS2X_VU1_GENERATOR}"
+                    --catalog "${PS2X_VU1_CATALOG_DIR}" --out "${PS2X_VU1GEN_DIR}"
+            RESULT_VARIABLE PS2X_VU1_GEN_RESULT)
+        if(NOT PS2X_VU1_GEN_RESULT EQUAL 0)
+            message(WARNING "vu1recomp failed (${PS2X_VU1_GEN_RESULT}); VU1 will use the interpreter")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${PS2X_VU1_CATALOG_DIR}/index.txt"
+            "${PS2X_VU1_GENERATOR}"
+            "${PS2X_VU1_GENERATOR_DIR}/vu1decode.py")
+    endif()
+    file(GLOB PS2X_VU1GEN_SOURCES CONFIGURE_DEPENDS "${PS2X_VU1GEN_DIR}/vu1rec_*.cpp")
+    if(PS2X_VU1GEN_SOURCES)
+        message(STATUS "VU1 native microprograms: ${PS2X_VU1GEN_SOURCES}")
+        target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1GEN_SOURCES})
+        set_source_files_properties(${PS2X_VU1GEN_SOURCES} PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION TRUE
+            SKIP_PRECOMPILE_HEADERS TRUE
+            COMPILE_OPTIONS "-O2;-ffp-contract=off;-frounding-math")
+    else()
+        message(STATUS "VU1 native microprograms: none in ${PS2X_VU1GEN_DIR}")
+    endif()
 endif()
 
 if(PS2X_DEFAULT_BOOT_ELF_DEFINE)

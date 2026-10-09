@@ -965,6 +965,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
+            noteGsPrivWrite(reg, *reg, newVal);
             *reg = newVal;
         }
         return;
@@ -1022,6 +1023,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
+            noteGsPrivWrite(reg, *reg, value);
             *reg = value;
         }
         return;
@@ -1173,7 +1175,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            const uint64_t newVal = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            noteGsPrivWrite(reg, *reg, newVal);
+            *reg = newVal;
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -1558,11 +1562,43 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     enqueueTransfer(madr, qwc);
                 }
 
+                static const bool s_traceDma = std::getenv("PS2X_TRACE_DMA") != nullptr;
+                if (s_traceDma && channelBase != 0x1000A000u)
+                {
+                    static uint32_t s_traceCount = 0u;
+                    if (s_traceCount++ < 200u)
+                    {
+                        std::printf("[dma] ch=0x%08x chcr=0x%08x madr=0x%08x qwc=0x%x tadr=0x%08x pending=%zu\n",
+                                    channelBase, value, madr, qwc, m_ioRegisters[channelBase + 0x30],
+                                    channelBase == 0x10009000u ? m_pendingVif1Transfers.size() : m_pendingVif0Transfers.size());
+                    }
+                }
+
                 const bool autoProcessTransfers =
                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
                 if (autoProcessTransfers)
                 {
                     processPendingTransfers();
+                }
+            }
+
+            // A VIF chain that carried no payload (or could not be walked) still ends on real
+            // hardware: STR clears and the channel's D_STAT bit is raised. Without this the
+            // game's "wait for previous VIF1 transfer" loop (e.g. PAL 0x00228178) never exits.
+            if ((channelBase == 0x10009000u && m_pendingVif1Transfers.empty()) ||
+                (channelBase == 0x10008000u && m_pendingVif0Transfers.empty()))
+            {
+                uint32_t &chcrRegister = m_ioRegisters[channelBase + 0x00];
+                if ((chcrRegister & 0x100u) != 0u)
+                {
+                    const uint32_t channelBit = (channelBase == 0x10009000u) ? 1u : 0u;
+                    uint32_t &dstat = m_ioRegisters[0x1000E010u];
+                    dstat |= (1u << channelBit);
+                    if (((dstat & 0x3FFu) & ((dstat >> 16) & 0x3FFu)) != 0u)
+                        dstat |= (1u << 31);
+                    queueCompletedDmacCause(channelBit);
+                    chcrRegister &= ~0x100u;
+                    m_ioRegisters[channelBase + 0x20] = 0u;
                 }
             }
         }
