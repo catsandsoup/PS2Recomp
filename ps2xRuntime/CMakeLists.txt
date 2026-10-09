@@ -408,7 +408,7 @@ if(PS2X_ENABLE_RUNTIME_LOGS)
 endif()
 
 # Game hooks (entry/exit hooks by guest address) and the GOALS Q5 starting-car chooser.
-target_sources(ps2_runtime PRIVATE src/lib/game_hooks.cpp src/lib/starter_car.cpp)
+target_sources(ps2_runtime PRIVATE src/lib/game_hooks.cpp src/lib/starter_car.cpp src/lib/hfr_recorder.cpp)
 
 if(PS2X_ENABLE_AGRESSIVE_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC

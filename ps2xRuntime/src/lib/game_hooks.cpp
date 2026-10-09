@@ -2,6 +2,7 @@
 // guest address, via the dense function table's entry slot (the PS2X_TRACE_CALLS mechanism).
 #include "game_hooks.h"
 #include "starter_car.h"
+#include "hfr_recorder.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -91,6 +92,7 @@ namespace ps2x::hooks
             return;
         // Built-in game modules (each adds hooks only when its option is on).
         ps2x::starter::installHooks();
+        ps2x::hfr::installHooks(runtime); // G4b recorder: PS2X_HFR_RECORD=1 only
 
         for (const Hook &h : pending())
         {

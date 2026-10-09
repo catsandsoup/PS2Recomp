@@ -1,6 +1,14 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
+#include "hfr_recorder.h"
 #include <algorithm>
 #include <cstring>
+#include <unordered_map>
+
+// G4b recorder attribution tags, keyed by the packet's heap buffer (stable while the packet is queued: the
+// queue's reallocation and stable_sort move the vectors, not their buffers). Kept here instead of a
+// GifArbiterPacket field so the recorder does not change a header every generated TU includes.
+// EE thread only; touched only when ps2x::hfr::g_on.
+static std::unordered_map<const uint8_t *, uint32_t> s_hfrTags;
 
 // Path of the packet currently being processed (diagnostics: vertex/triangle traces).
 thread_local uint8_t g_gifCurrentPath = 0u;
@@ -30,8 +38,11 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
+    const uint32_t hfrTag = ps2x::hfr::g_on ? ps2x::hfr::onGifSubmit(static_cast<uint8_t>(pathId)) : 0u;
     pkt.data.resize(sizeBytes);
     std::memcpy(pkt.data.data(), data, sizeBytes);
+    if (ps2x::hfr::g_on)
+        s_hfrTags[pkt.data.data()] = hfrTag;
     m_queue.push_back(std::move(pkt));
 }
 
@@ -60,11 +71,19 @@ void GifArbiter::drain()
         if (!pkt.data.empty())
         {
             g_gifCurrentPath = static_cast<uint8_t>(pkt.pathId);
+            if (ps2x::hfr::g_on)
+            {
+                const auto it = s_hfrTags.find(pkt.data.data());
+                ps2x::hfr::onGifDrain(static_cast<uint8_t>(pkt.pathId), pkt.data.data(), static_cast<uint32_t>(pkt.data.size()),
+                                      it != s_hfrTags.end() ? it->second : 0u);
+            }
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
             g_gifCurrentPath = 0u;
         }
     }
     m_queue.clear();
+    if (ps2x::hfr::g_on)
+        s_hfrTags.clear();
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

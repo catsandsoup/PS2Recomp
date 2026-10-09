@@ -1,3 +1,4 @@
+#include "hfr_recorder.h"
 #include "runtime/ee_scheduler.h"
 
 #include "ps2_log.h"
@@ -1937,6 +1938,9 @@ void EeScheduler::processEvent(const EeEvent &event)
             if (((m_vsyncTick + 1u) % s_every) == 0u)
                 m_runtime.dumpPresentationFrame(s_detDumpDir, m_vsyncTick + 1u);
         }
+        // G4b: close the high-frame-rate record of this tick at the same point the det frame dump samples.
+        if (ps2x::hfr::g_on)
+            ps2x::hfr::onVBlank(m_vsyncTick + 1u, m_runtime.memory().gs().dispfb2);
     }
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
