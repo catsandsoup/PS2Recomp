@@ -1,5 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "hfr_recorder.h"
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -299,6 +300,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    if (ps2x::hfr::g_on)
+        ps2x::hfr::onVifChunk(data, sizeBytes);
 
     uint32_t pos = 0;
 
@@ -416,8 +419,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            if (ps2x::hfr::g_on)
+                ps2x::hfr::onMscalBegin(startPC, runTop, runItop);
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
+            if (ps2x::hfr::g_on)
+                ps2x::hfr::onMscalEnd();
             continue;
         }
         else if (opcode == VIF_MSCNT)
@@ -434,8 +441,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            if (ps2x::hfr::g_on)
+                ps2x::hfr::onMscalBegin(0xFFFFFFFFu, runTop, runItop);
             if (m_vu1MscntCallback)
                 m_vu1MscntCallback(runTop, runItop);
+            if (ps2x::hfr::g_on)
+                ps2x::hfr::onMscalEnd();
             continue;
         }
         else if (opcode == VIF_STMASK)
@@ -571,6 +582,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
+
+            if (ps2x::hfr::g_on && m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+                ps2x::hfr::onUnpack(cmd, vuAddr, writeVectorCount, vif1_regs.cycle, data + pos, totalBytes);
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {

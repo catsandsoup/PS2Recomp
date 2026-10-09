@@ -638,6 +638,30 @@ namespace ps2_syscalls
                 fillRpcDebugPreview(rdram, sendBuf, sendSize, event.sendPreview, event.sendPreviewSize);
                 fillRpcDebugPreview(rdram, receiveBuffer, receiveSize, event.recvPreview, event.recvPreviewSize);
                 event.result = 0;
+                static const bool s_traceRpc = std::getenv("PS2X_TRACE_RPC") != nullptr;
+                if (s_traceRpc)
+                {
+                    static std::mutex s_traceMutex;
+                    static std::unordered_map<uint64_t, uint32_t> s_traceCounts;
+                    std::lock_guard<std::mutex> traceLock(s_traceMutex);
+                    uint32_t &count = s_traceCounts[(static_cast<uint64_t>(sid) << 32) | rpcNum];
+                    if (count++ < 24u)
+                    {
+                        const auto word = [&](uint32_t addr, uint32_t index) -> uint32_t
+                        {
+                            const uint8_t *p = addr ? getConstMemPtr(rdram, addr + index * 4u) : nullptr;
+                            uint32_t v = 0u;
+                            if (p)
+                                std::memcpy(&v, p, sizeof(v));
+                            return v;
+                        };
+                        std::printf("[rpc] sid=0x%08x fn=0x%x mode=%u flags=0x%x n=%u send[%u]=%08x %08x %08x %08x recv[%u]=%08x %08x %08x %08x\n",
+                                    sid, rpcNum, mode, event.flags, count, sendSize,
+                                    word(sendBuf, 0), word(sendBuf, 1), word(sendBuf, 2), word(sendBuf, 3),
+                                    receiveSize,
+                                    word(receiveBuffer, 0), word(receiveBuffer, 1), word(receiveBuffer, 2), word(receiveBuffer, 3));
+                    }
+                }
 #if PS2X_ENABLE_IOP_RPC_TRACE
                 if ((event.flags & kSifRpcDebugFlagUnhandled) != 0u)
                 {

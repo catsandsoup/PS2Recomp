@@ -23,16 +23,19 @@ namespace
         expectEqual(f.sample(tex, 8), kGreen, "swizzle carry wraps through the 4 MiB boundary");
     }
 
-    void staleMirror()
+    // Texture reads are coherent with local memory: the backend has no texture page buffer, so every
+    // write (host upload, local copy, raster output) is visible to the next draw without TEXFLUSH.
+    // Real hardware needs TEXFLUSH for that; PCSX2's software renderer does not model the stale
+    // buffer either (it invalidates its texture cache on transfers and frame/Z writes instead).
+    void mirrorCoherence()
     {
         BackendFixture f;
         auto tex = texture();
         f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, 0, 0, kRed);
-        expectEqual(f.sample(tex), kRed, "prime the following physical page");
+        expectEqual(f.sample(tex), kRed, "sample the following physical page");
         f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, 0, 0, kGreen);
-        f.backend.TextureFlush();
         tex.tbp0 = 31;
-        expectEqual(f.sample(tex, 8), kGreen, "TEXFLUSH must not expose stale bytes in the old mirror");
+        expectEqual(f.sample(tex, 8), kGreen, "an aliasing descriptor sees the new bytes");
     }
 
     void pageAlternation()
@@ -48,19 +51,16 @@ namespace
         }
     }
 
-    void flushVisibility()
+    void writeVisibility()
     {
         BackendFixture f;
         auto tex = texture();
         f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, 0, 0, kRed);
-        expectEqual(f.sample(tex), kRed, "initial cache fill");
+        expectEqual(f.sample(tex), kRed, "initial sample");
         f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, 0, 0, kGreen);
-        expectEqual(f.backend.ReadVram(tex.psm, tex.tbp0, tex.tbw, 0, 0), kGreen, "canonical VRAM changes immediately");
-        f.backend.Flush();
-        f.backend.Sync(GSSyncReason::Finish);
-        expectEqual(f.sample(tex), kRed, "ordinary flush and FINISH do not invalidate texels");
+        expectEqual(f.sample(tex), kGreen, "a local memory write is visible to the next draw");
         f.backend.TextureFlush();
-        expectEqual(f.sample(tex), kGreen, "TEXFLUSH exposes the updated texels");
+        expectEqual(f.sample(tex), kGreen, "TEXFLUSH changes nothing");
     }
 
     void uploadVisibility()
@@ -77,9 +77,7 @@ namespace
         transfer.trxreg.rrw = transfer.trxreg.rrh = 1;
         f.backend.BeginTransfer(transfer);
         f.backend.UploadImage(reinterpret_cast<const uint8_t*>(&kGreen), sizeof(kGreen));
-        expectEqual(f.sample(tex), kRed, "host upload does not implicitly flush texels");
-        f.backend.TextureFlush();
-        expectEqual(f.sample(tex), kGreen, "host upload visible after TEXFLUSH");
+        expectEqual(f.sample(tex), kGreen, "host upload visible to the next draw");
     }
 
     void localCopyVisibility()
@@ -97,9 +95,7 @@ namespace
         transfer.bitbltbuf.dbp = tex.tbp0;
         transfer.trxreg.rrw = transfer.trxreg.rrh = 1;
         f.backend.BeginTransfer(transfer);
-        expectEqual(f.sample(tex), kRed, "local copy does not implicitly flush texels");
-        f.backend.TextureFlush();
-        expectEqual(f.sample(tex), kGreen, "local copy visible after TEXFLUSH");
+        expectEqual(f.sample(tex), kGreen, "local copy visible to the next draw");
     }
 
     void rasterVisibility()
@@ -118,9 +114,7 @@ namespace
             vertex.b = 0;
         }
         f.backend.Submit(batch);
-        expectEqual(f.sample(tex), kRed, "raster writes do not implicitly flush texels");
-        f.backend.TextureFlush();
-        expectEqual(f.sample(tex), kGreen, "render-to-texture visible after TEXFLUSH");
+        expectEqual(f.sample(tex), kGreen, "render-to-texture visible to the next draw");
     }
 
     void resetAndRebind()
@@ -168,8 +162,8 @@ int main(int argc, char** argv)
 {
     return run(argc, argv, {
         {"unaligned_texture", unalignedTexture}, {"unaligned_wrap", unalignedWrap},
-        {"stale_mirror", staleMirror}, {"page_alternation", pageAlternation},
-        {"flush_visibility", flushVisibility}, {"upload_visibility", uploadVisibility},
+        {"mirror_coherence", mirrorCoherence}, {"page_alternation", pageAlternation},
+        {"write_visibility", writeVisibility}, {"upload_visibility", uploadVisibility},
         {"local_copy_visibility", localCopyVisibility}, {"raster_visibility", rasterVisibility},
         {"reset_and_rebind", resetAndRebind}, {"invalid_vram_size", invalidVramSize},
         {"reserved_psm", reservedPsm}

@@ -73,6 +73,6 @@ namespace ps2x::iop::detail
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
         uint32_t m_nextDmaId = 1u;
-        bool m_sifInitialized = false;
+        bool m_sifInitialized = true; // SIFMAN is resident and initialized by the IOP boot before any IRX loads
     };
 }

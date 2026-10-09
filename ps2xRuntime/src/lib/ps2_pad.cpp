@@ -1,6 +1,16 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include "ps2_shell.h"
 #include <cstring>
+
+namespace
+{
+    // SH1: the same mapping for both shells; PS2X_SHELL=sdl3 reads the SDL3 shell's input snapshot.
+    bool padKeyDown(int k) { return ps2x::shell::sdl3Selected() ? ps2x::shell::keyDown(k) : IsKeyDown(k); }
+    bool padGamepadAvailable(int i) { return ps2x::shell::sdl3Selected() ? ps2x::shell::gamepadAvailable(i) : IsGamepadAvailable(i); }
+    bool padGamepadButtonDown(int i, int b) { return ps2x::shell::sdl3Selected() ? ps2x::shell::gamepadButtonDown(i, b) : IsGamepadButtonDown(i, b); }
+    float padGamepadAxis(int i, int a) { return ps2x::shell::sdl3Selected() ? ps2x::shell::gamepadAxis(i, a) : GetGamepadAxisMovement(i, a); }
+}
 
 namespace
 {
@@ -39,49 +49,49 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
 
     uint16_t btns = 0xFFFFu;
     constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+    const bool useGamepad = padGamepadAvailable(kGamepad);
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
     if (useGamepad)
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
             clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
             clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
             clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
             clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
             clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
             clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
             clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
             clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
             clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
             clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
             clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
             clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
             clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
             clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
             clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+        if (padGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
             clearBit(PAD_R3);
 
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+        float lx = padGamepadAxis(kGamepad, GAMEPAD_AXIS_LEFT_X);
+        float ly = padGamepadAxis(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+        float rx = padGamepadAxis(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+        float ry = padGamepadAxis(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
         data[6] = static_cast<uint8_t>(128 + lx * 127);
         data[7] = static_cast<uint8_t>(128 + ly * 127);
         data[4] = static_cast<uint8_t>(128 + rx * 127);
@@ -89,33 +99,33 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     }
     else
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+        if (padKeyDown(KEY_UP) || padKeyDown(KEY_W))
             clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+        if (padKeyDown(KEY_DOWN) || padKeyDown(KEY_S))
             clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+        if (padKeyDown(KEY_LEFT) || padKeyDown(KEY_A))
             clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+        if (padKeyDown(KEY_RIGHT) || padKeyDown(KEY_D))
             clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+        if (padKeyDown(KEY_X) || padKeyDown(KEY_SPACE))
             clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+        if (padKeyDown(KEY_C) || padKeyDown(KEY_ESCAPE))
             clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+        if (padKeyDown(KEY_Z) || padKeyDown(KEY_KP_0))
             clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+        if (padKeyDown(KEY_V) || padKeyDown(KEY_KP_1))
             clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
+        if (padKeyDown(KEY_Q))
             clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
+        if (padKeyDown(KEY_E))
             clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
+        if (padKeyDown(KEY_LEFT_SHIFT))
             clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+        if (padKeyDown(KEY_RIGHT_SHIFT))
             clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
+        if (padKeyDown(KEY_ENTER))
             clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
+        if (padKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
     }
 

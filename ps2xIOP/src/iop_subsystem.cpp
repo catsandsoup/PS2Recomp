@@ -6,6 +6,7 @@
 #include "module_factories.h"
 #include "ps2x/iop/ps2_path.h"
 
+#include <cstdlib>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,6 +24,9 @@ namespace ps2x::iop
             coreServices.emplace_back(detail::createMcservService(host));
             coreServices.emplace_back(detail::createDbcmanService(host));
             coreServices.emplace_back(detail::createLibSdService(host));
+            coreServices.emplace_back(detail::createSndmodService(host));
+            if (std::getenv("PS2X_EMULATE_IOP_MODULES") == nullptr)
+                coreServices.emplace_back(detail::createNativeBuiltinModulesService(host));
             refreshServiceModuleKeys();
             rebuildRoutes();
         }
@@ -63,6 +67,22 @@ namespace ps2x::iop
                     }
                 }
             }
+        }
+
+        [[nodiscard]] bool nativeReplacementFor(std::string_view path) const
+        {
+            const std::string key = ps2PathLeafKey(path);
+            for (const auto &service : coreServices)
+            {
+                if (!service->replacesPhysicalModule())
+                    continue;
+                for (std::string_view alias : service->moduleAliases())
+                {
+                    if (ps2PathLeafKey(alias) == key)
+                        return true;
+                }
+            }
+            return false;
         }
 
         void recordLoadOutcome(std::string_view path, bool hle)
@@ -120,7 +140,7 @@ namespace ps2x::iop
         if (!parsed)
             return {true, -1, -1};
 
-        if (parsed.device != Ps2PathDevice::Rom0)
+        if (parsed.device != Ps2PathDevice::Rom0 && !m_impl->nativeReplacementFor(path))
         {
             ModuleLoadResult physical = m_impl->emulator.loadModule(path, arguments, argumentSize);
             if (physical.moduleId > 0)

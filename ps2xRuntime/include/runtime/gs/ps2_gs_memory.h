@@ -7,12 +7,11 @@
 #include <span>
 
 #include "types.h"
-#include "runtime/gs/gs_texture_page_cache.h"
 
 namespace GSMem
 {
 	constexpr usz MEMORY_SIZE = 4_mb;
-	constexpr usz GS_PAGE_SIZE = TexturePageCache::kPageSize;
+	constexpr usz GS_PAGE_SIZE = 8192;
 
 	// these are all the same regardless of storage mode
 	constexpr usz BLOCKS_PER_PAGE = 32;
@@ -262,7 +261,7 @@ namespace GSMem
 		static constexpr void Write(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y, PackedT value);
 
 		// reads the pixel
-		static constexpr auto Read(const PageLookupTableT& table, const u8* data, u32 block, u32 bw, u32 x, u32 y, TexturePageCache* cache = nullptr) -> PackedT;
+		static constexpr auto Read(const PageLookupTableT& table, const u8* data, u32 block, u32 bw, u32 x, u32 y) -> PackedT;
 
 		static_assert(BlocksPerPage() == BLOCKS_PER_PAGE);
 		static_assert(IsValidPsm(psm));
@@ -502,16 +501,15 @@ namespace GSMem
 	}
 
 	template<PixelStorageMode psm>
-	constexpr auto PixelStorageTraits<psm>::Read(const PageLookupTableT& table, const u8* data, u32 block, u32 bw, u32 x, u32 y, TexturePageCache* cache) -> PackedT
+	constexpr auto PixelStorageTraits<psm>::Read(const PageLookupTableT& table, const u8* data, u32 block, u32 bw, u32 x, u32 y) -> PackedT
 	{
 		const u32 pixel_addr = Address(table, block, bw, x, y);
 		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + BitOffset();
 		const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
 		const u32 shift = bits % 8;
 
-		const u8* source = cache ? cache->Resolve(data, byte_addr) : data + byte_addr;
 		PackedT v;
-		std::memcpy(&v, source, sizeof(PackedT));
+		std::memcpy(&v, data + byte_addr, sizeof(PackedT));
 
 		switch (psm)
 		{
@@ -540,8 +538,118 @@ namespace GSMem
 
 	void InitLookupTables();
 
-    // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
-    u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
+	// The page lookup tables behind the Read*/Write* functions below (filled by InitLookupTables).
+	// RGB24 and the high-byte indexed modes share the PSMCT32 table, Z24 shares the PSMZ32 table.
+	extern PixelStorageTraits<C32>::PageLookupTableT PageTableC32;
+	extern PixelStorageTraits<Z32>::PageLookupTableT PageTableZ32;
+	extern PixelStorageTraits<C16>::PageLookupTableT PageTableC16;
+	extern PixelStorageTraits<C16S>::PageLookupTableT PageTableC16S;
+	extern PixelStorageTraits<Z16>::PageLookupTableT PageTableZ16;
+	extern PixelStorageTraits<Z16S>::PageLookupTableT PageTableZ16S;
+	extern PixelStorageTraits<P8>::PageLookupTableT PageTableP8;
+	extern PixelStorageTraits<P4>::PageLookupTableT PageTableP4;
+
+	template<PixelStorageMode psm>
+	const auto& PageTable()
+	{
+		if constexpr (psm == C32 || psm == C24 || psm == P8H || psm == P4HL || psm == P4HH)
+			return PageTableC32;
+		else if constexpr (psm == Z32 || psm == Z24)
+			return PageTableZ32;
+		else if constexpr (psm == C16)
+			return PageTableC16;
+		else if constexpr (psm == C16S)
+			return PageTableC16S;
+		else if constexpr (psm == Z16)
+			return PageTableZ16;
+		else if constexpr (psm == Z16S)
+			return PageTableZ16S;
+		else if constexpr (psm == P8)
+			return PageTableP8;
+		else
+			return PageTableP4;
+	}
+
+	// A buffer (base block, buffer width) in one storage mode. Location() is exactly the address
+	// arithmetic of PixelStorageTraits<psm>::Read/Write (page id, page table, bit offset, 4 MiB wrap,
+	// all modulo 2^32), with the terms that only depend on the buffer computed once in the constructor.
+	// The rasteriser binds one per primitive batch instead of going through Read*/Write* per pixel.
+	template<PixelStorageMode psm>
+	struct SwizzledSurface
+	{
+		using Traits = PixelStorageTraits<psm>;
+		using PackedT = typename Traits::PackedT;
+		static constexpr Extent2D kPage = Traits::PageExtent();
+		static constexpr u32 kPixelsPerPage = static_cast<u32>(Traits::PixelsPerPage());
+		static constexpr u32 kBitWidth = static_cast<u32>(UnpackedBitWidth(psm));
+		static constexpr u32 kBitOffset = static_cast<u32>(Traits::BitOffset());
+		static constexpr u32 kAddressMask = static_cast<u32>(MEMORY_SIZE - sizeof(PackedT));
+
+		struct Location
+		{
+			u32 byteAddress;
+			u32 shift;
+		};
+
+		const LookupTable<u16, kPage.x, kPage.y>* blockTable = nullptr;
+		u32 basePage = 0;
+		u32 pagesPerRow = 0;
+
+		SwizzledSurface() = default;
+		SwizzledSurface(u32 block, u32 bw)
+			: blockTable(&PageTable<psm>()[block % Traits::BlocksPerPage()]),
+			  basePage(block / static_cast<u32>(Traits::BlocksPerPage())),
+			  pagesPerRow((bw * 64u) / kPage.x)
+		{
+		}
+
+		Location Locate(u32 x, u32 y) const
+		{
+			const u32 page = basePage + (y / kPage.y) * pagesPerRow + x / kPage.x;
+			const u32 pixel = page * kPixelsPerPage + (*blockTable)[y % kPage.y][x % kPage.x];
+			const u32 bits = pixel * kBitWidth + kBitOffset;
+			return {(bits / 8u) & kAddressMask, bits % 8u};
+		}
+
+		// Same result as PixelStorageTraits<psm>::Read.
+		static PackedT ReadAt(const u8* data, Location at)
+		{
+			PackedT v;
+			std::memcpy(&v, data + at.byteAddress, sizeof(PackedT));
+			if constexpr (psm == C24 || psm == Z24)
+				return v & 0x00FFFFFF;
+			else if constexpr (psm == P4 || psm == P4HL || psm == P4HH)
+				return (v >> at.shift) & 0x0F;
+			else
+				return v;
+		}
+
+		// Same effect as PixelStorageTraits<psm>::Write.
+		static void WriteAt(u8* data, Location at, PackedT value)
+		{
+			u8* ptr = data + at.byteAddress;
+			if constexpr (psm == C24 || psm == Z24 || psm == P4 || psm == P4HL || psm == P4HH)
+			{
+				PackedT old;
+				std::memcpy(&old, ptr, sizeof(PackedT));
+				if constexpr (psm == C24 || psm == Z24)
+					value = (old & 0xFF000000) | (value & 0x00FFFFFF);
+				else
+					value = (old & ~(0x0F << at.shift)) | ((value & 0x0F) << at.shift);
+			}
+			std::memcpy(ptr, &value, sizeof(PackedT));
+		}
+
+		PackedT Read(const u8* data, u32 x, u32 y) const
+		{
+			return ReadAt(data, Locate(x, y));
+		}
+
+		void Write(u8* data, u32 x, u32 y, PackedT value) const
+		{
+			WriteAt(data, Locate(x, y), value);
+		}
+	};
 
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);

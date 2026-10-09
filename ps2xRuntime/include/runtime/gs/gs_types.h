@@ -247,6 +247,8 @@ struct GSDrawState
     uint16_t textureWidth = 1;
     uint16_t textureHeight = 1;
     bool linearFilter = false;
+    uint8_t gifPath = 0;    // G3a: GIF path of the packet that drew it (1 = PATH1/VU1, 2, 3; 0 = unknown)
+    uint32_t gifPacket = 0; // G3a: drained-packet sequence number (widescreen 2D anchoring groups)
 };
 
 struct GSPrimitiveBatch

@@ -1,4 +1,20 @@
+#include <chrono>
+#include <cstdio>
 #include "Common.h"
+#include <atomic>
+extern std::atomic<uint32_t> g_gsDrawKicksByFbp[512];
+static uint32_t traceCountBufferPixels(PS2Runtime *runtime, uint32_t fbp)
+{
+    const uint8_t *vram = runtime->memory().getGSVRAM();
+    if (!vram)
+        return 0u;
+    runtime->gs().waitForRasterIdle(); // the GS thread may still be drawing queued primitives
+    const uint32_t *words = reinterpret_cast<const uint32_t *>(vram + static_cast<size_t>(fbp) * 8192u);
+    uint32_t n = 0u;
+    for (uint32_t i = 0; i < 512u * 256u; ++i)
+        n += (words[i] & 0x00FFFFFFu) != 0u;
+    return n;
+}
 #include "GS.h"
 #include "ps2_log.h"
 #include "runtime/gs/ps2_gs_common.h"
@@ -1133,6 +1149,27 @@ namespace ps2_stubs
         const uint32_t envAddr = getRegU32(ctx, 4);
         const uint32_t which = getRegU32(ctx, 5) & 1u;
 
+        // Game frame-rate meter: PS2X_TRACE_TICKS prints game swaps per wall-clock second.
+        static const bool s_traceFps = std::getenv("PS2X_TRACE_TICKS") != nullptr;
+        if (s_traceFps)
+        {
+            using Clock = std::chrono::steady_clock;
+            static Clock::time_point s_windowStart = Clock::now();
+            static uint32_t s_swaps = 0u;
+            static uint64_t s_totalSwaps = 0u;
+            ++s_swaps;
+            ++s_totalSwaps;
+            const auto now = Clock::now();
+            const double seconds = std::chrono::duration<double>(now - s_windowStart).count();
+            if (seconds >= 2.0)
+            {
+                std::printf("[fps] game=%.1f swaps=%llu\n", s_swaps / seconds,
+                            static_cast<unsigned long long>(s_totalSwaps));
+                s_swaps = 0u;
+                s_windowStart = now;
+            }
+        }
+
         GsDBuffDcMem db{};
         if (!runtime || !readGsDBuffDc(rdram, envAddr, db))
         {
@@ -1140,7 +1177,80 @@ namespace ps2_stubs
             return;
         }
 
+        // GS FIFO ordering: every primitive the game queued for the frame it just finished must
+        // rasterize before the swap rewrites FRAME/clear state, or it lands in the next buffer.
+        static const bool s_traceVram = std::getenv("PS2X_TRACE_SWAP") != nullptr;
+        static uint32_t s_vramTraceIndex = 0u;
+        static const uint32_t s_vramTraceStart = s_traceVram ? static_cast<uint32_t>(std::strtoul(std::getenv("PS2X_TRACE_SWAP"), nullptr, 10)) : 0u;
+        const bool traceVramNow = s_traceVram && s_vramTraceIndex >= s_vramTraceStart && s_vramTraceIndex < s_vramTraceStart + 12u;
+        ++s_vramTraceIndex;
+        if (traceVramNow)
+            std::printf("[vram] before-drain fb0=%u fb128=%u\n", traceCountBufferPixels(runtime, 0u), traceCountBufferPixels(runtime, 128u));
+        runtime->memory().processPendingTransfers();
+        runtime->memory().flushMaskedPath3Packets();
+        runtime->gifArbiter().drain();
+        if (traceVramNow)
+            std::printf("[vram] after-drain  fb0=%u fb128=%u\n", traceCountBufferPixels(runtime, 0u), traceCountBufferPixels(runtime, 128u));
+
+        static const bool s_traceSwap = std::getenv("PS2X_TRACE_SWAP") != nullptr;
+        if (s_traceSwap)
+        {
+            static uint32_t s_swapIndex = 0u;
+            static const uint32_t s_traceStart = static_cast<uint32_t>(std::strtoul(std::getenv("PS2X_TRACE_SWAP"), nullptr, 10));
+            const uint32_t index = s_swapIndex++ - s_traceStart + 100u;
+            if (index >= 100u && index < 102u)
+            {
+                const auto dumpEnv = [](const char *tag, const GsRegPairMem *pairs)
+                {
+                    std::printf("[swap]   %s:", tag);
+                    for (int i = 0; i < 8; ++i)
+                        std::printf(" r%02llx=%llx", (unsigned long long)(pairs[i].reg & 0xFF), (unsigned long long)pairs[i].value);
+                    std::printf("\n");
+                };
+                const auto dumpClear = [](const char *tag, const GsClearMem &c)
+                {
+                    std::printf("[swap]   %s: testa=%llx prim=%llx rgbaq=%llx xyz2a=%llx xyz2b=%llx testb=%llx regs=%llx,%llx,%llx,%llx,%llx,%llx\n", tag,
+                                (unsigned long long)c.testa.value, (unsigned long long)c.prim.value, (unsigned long long)c.rgbaq.value,
+                                (unsigned long long)c.xyz2a.value, (unsigned long long)c.xyz2b.value, (unsigned long long)c.testb.value,
+                                (unsigned long long)c.testa.reg, (unsigned long long)c.prim.reg, (unsigned long long)c.rgbaq.reg,
+                                (unsigned long long)c.xyz2a.reg, (unsigned long long)c.xyz2b.reg, (unsigned long long)c.testb.reg);
+                };
+                dumpClear("clear0", db.clear0);
+                dumpClear("clear1", db.clear1);
+                dumpEnv("draw01", reinterpret_cast<const GsRegPairMem *>(&db.draw01));
+                dumpEnv("draw02", reinterpret_cast<const GsRegPairMem *>(&db.draw02));
+                dumpEnv("draw11", reinterpret_cast<const GsRegPairMem *>(&db.draw11));
+                dumpEnv("draw12", reinterpret_cast<const GsRegPairMem *>(&db.draw12));
+            }
+            if (index >= 100u && index < 124u)
+            {
+                std::printf("[swap]   kicks since last swap:");
+                for (uint32_t fbp = 0; fbp < 512u; ++fbp)
+                {
+                    const uint32_t n = g_gsDrawKicksByFbp[fbp].exchange(0u);
+                    if (n)
+                        std::printf(" fbp%u=%u", fbp, n);
+                }
+                std::printf("\n");
+                const GsDispEnvMem &d = db.disp[which];
+                std::printf("[swap] #%u which=%u dispfb=0x%llx(fbp=%llu) display=0x%llx pmode=0x%llx smode2=0x%llx "
+                            "draw0.frame1=0x%llx draw0.frame2=0x%llx draw1.frame1=0x%llx draw1.frame2=0x%llx\n",
+                            index, which,
+                            (unsigned long long)d.dispfb, (unsigned long long)(d.dispfb & 0x1FFu),
+                            (unsigned long long)d.display, (unsigned long long)d.pmode, (unsigned long long)d.smode2,
+                            (unsigned long long)db.draw01.frame1.value, (unsigned long long)db.draw02.frame2.value,
+                            (unsigned long long)db.draw11.frame1.value, (unsigned long long)db.draw12.frame2.value);
+            }
+        }
         applyGsDispEnv(runtime, db.disp[which]);
+        // Present exactly at the game's swap: the displayed buffer is complete and the next
+        // frame's clear has not been queued yet. Opt out with PS2X_HOST_PRESENT_TIMER=1.
+        static const bool s_hostTimer = std::getenv("PS2X_HOST_PRESENT_TIMER") != nullptr;
+        if (!s_hostTimer)
+        {
+            runtime->gs().setGameDrivenPresentation(true);
+            runtime->gs().latchHostPresentationFrame();
+        }
         static uint32_t s_swapDbuffLogCount = 0u;
         if (s_swapDbuffLogCount < 32u)
         {
@@ -1160,11 +1270,15 @@ namespace ps2_stubs
             });
             ++s_swapDbuffLogCount;
         }
+        static const bool s_forceColorClear = std::getenv("PS2X_FORCE_SWAP_COLOR_CLEAR") != nullptr;
         if (which == 0u)
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
-            if (hasSeededGsClearPacket(db.clear0))
+            // The game's own clear sprite (below) goes through the GS pipeline and honours its TEST
+            // register (this title clears Z only and keeps colour between frames). The unconditional
+            // colour wipe is kept only as an opt-in for titles that need it.
+            if (s_forceColorClear && hasSeededGsClearPacket(db.clear0))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
                 runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
@@ -1175,7 +1289,10 @@ namespace ps2_stubs
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
-            if (hasSeededGsClearPacket(db.clear1))
+            // The game's own clear sprite (below) goes through the GS pipeline and honours its TEST
+            // register (this title clears Z only and keeps colour between frames). The unconditional
+            // colour wipe is kept only as an opt-in for titles that need it.
+            if (s_forceColorClear && hasSeededGsClearPacket(db.clear1))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
                 runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
@@ -1183,6 +1300,11 @@ namespace ps2_stubs
             applyGsClearPacket(runtime, db.clear1);
         }
 
+        if (traceVramNow)
+        {
+            runtime->gifArbiter().drain();
+            std::printf("[vram] after-clear  fb0=%u fb128=%u (which=%u)\n", traceCountBufferPixels(runtime, 0u), traceCountBufferPixels(runtime, 128u), which);
+        }
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
     }
 

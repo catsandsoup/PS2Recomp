@@ -1,6 +1,8 @@
 #ifndef PS2_DEBUG_PANEL_H
 #define PS2_DEBUG_PANEL_H
 
+#include <cstdlib>
+
 class PS2Runtime;
 
 class PS2DebugPanel
@@ -16,7 +18,8 @@ public:
 
 private:
     bool m_initialized = false;
-    bool m_visible = true;
+    // Hidden by default (shipping UX); F1 toggles, PS2X_DEBUG_UI=1 starts with it open.
+    bool m_visible = std::getenv("PS2X_DEBUG_UI") != nullptr;
     bool m_showRegisters = true;
     unsigned int m_memoryAddress = 0x00100000u;
     unsigned int m_memoryBytes = 0x100u;
