@@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_threaded_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -393,7 +394,9 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
+    src/lib/vu/ps2_vu1_recomp.cpp
     src/lib/games_database.cpp
+    src/lib/ps2_call_trace.cpp
 )
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -437,8 +440,10 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
+set(PS2X_RUNNER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner" CACHE PATH "Directory holding generated recompiled sources and headers")
+
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+    "${PS2X_RUNNER_DIR}/*.cpp"
 )
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
@@ -476,8 +481,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_RUNNER_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_RUNNER_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -489,6 +494,51 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})
+endif()
+
+target_include_directories(ps2EntryRunner PRIVATE "${PS2X_RUNNER_DIR}")
+
+# ---------------------------------------------------------------------------
+# Statically recompiled VU1 microprograms (game/tools/vu1recomp).
+#   PS2X_VU1_CATALOG_DIR : VU1 catalog captured with PS2X_VU1_CATALOG=<dir>
+#                          (index.txt + <hash>.vu1).  When set, the generator
+#                          runs at configure time and re-runs whenever the
+#                          catalog index or the generator changes.
+#   PS2X_VU1_GENERATOR   : path to vu1recomp.py
+#   PS2X_VU1GEN_DIR      : output dir for generated vu1rec_<hash>.cpp; every
+#                          such file present is compiled into ps2EntryRunner.
+# Generated code is derived from disc data: keep PS2X_VU1GEN_DIR out of git.
+# ---------------------------------------------------------------------------
+set(PS2X_VU1_CATALOG_DIR "" CACHE PATH "VU1 catalog directory (index.txt + <hash>.vu1) for the VU1 static recompiler")
+set(PS2X_VU1_GENERATOR "" CACHE FILEPATH "Path to vu1recomp.py")
+set(PS2X_VU1GEN_DIR "" CACHE PATH "Directory holding generated VU1 microprogram C++ (vu1rec_*.cpp)")
+if(PS2X_VU1GEN_DIR)
+    if(PS2X_VU1_CATALOG_DIR AND PS2X_VU1_GENERATOR AND EXISTS "${PS2X_VU1_CATALOG_DIR}/index.txt")
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        get_filename_component(PS2X_VU1_GENERATOR_DIR "${PS2X_VU1_GENERATOR}" DIRECTORY)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" "${PS2X_VU1_GENERATOR}"
+                    --catalog "${PS2X_VU1_CATALOG_DIR}" --out "${PS2X_VU1GEN_DIR}"
+            RESULT_VARIABLE PS2X_VU1_GEN_RESULT)
+        if(NOT PS2X_VU1_GEN_RESULT EQUAL 0)
+            message(WARNING "vu1recomp failed (${PS2X_VU1_GEN_RESULT}); VU1 will use the interpreter")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${PS2X_VU1_CATALOG_DIR}/index.txt"
+            "${PS2X_VU1_GENERATOR}"
+            "${PS2X_VU1_GENERATOR_DIR}/vu1decode.py")
+    endif()
+    file(GLOB PS2X_VU1GEN_SOURCES CONFIGURE_DEPENDS "${PS2X_VU1GEN_DIR}/vu1rec_*.cpp")
+    if(PS2X_VU1GEN_SOURCES)
+        message(STATUS "VU1 native microprograms: ${PS2X_VU1GEN_SOURCES}")
+        target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1GEN_SOURCES})
+        set_source_files_properties(${PS2X_VU1GEN_SOURCES} PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION TRUE
+            SKIP_PRECOMPILE_HEADERS TRUE
+            COMPILE_OPTIONS "-O2;-ffp-contract=off;-frounding-math")
+    else()
+        message(STATUS "VU1 native microprograms: none in ${PS2X_VU1GEN_DIR}")
+    endif()
 endif()
 
 if(PS2X_DEFAULT_BOOT_ELF_DEFINE)

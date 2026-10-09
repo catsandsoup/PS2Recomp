@@ -75,21 +75,24 @@ namespace ps2recomp
         uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
 
-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ps2_vu0_div(ctx, fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
     {
         uint8_t ftf = inst.vectorInfo.ftf;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
+        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ps2_vu0_sqrt(ctx, ft); }}", ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
     {
+        // VRSQRT Q, fs.fsf, ft.ftf: Q = fs / sqrt(ft)
+        uint8_t fsf = inst.vectorInfo.fsf;
         uint8_t ftf = inst.vectorInfo.ftf;
+        uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ps2_vu0_rsqrt(ctx, fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
@@ -754,9 +757,7 @@ namespace ps2recomp
         float scale = (shift == 0) ? 1.0f : static_cast<float>(1 << shift);
 
         return fmt::format("{{ __m128 src = ctx->vu0_vf[{}]; "
-                           "src = _mm_mul_ps(src, _mm_set1_ps({})); "
-                           "__m128i res_i = _mm_cvttps_epi32(src); "
-                           "__m128 res = _mm_castsi128_ps(res_i); "
+                           "__m128 res = ps2_vu_ftoi(src, {}); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs, codegen::formatFloatLiteral(scale),

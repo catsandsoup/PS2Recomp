@@ -28,6 +28,11 @@ add_library(ps2_iop STATIC
     src/modules/dbcman.cpp
     src/modules/libsd.cpp
     src/modules/mcserv.cpp
+    src/modules/sndmod.cpp
+    src/modules/native_builtin.cpp
+    src/modules/sndmod/sndmod_driver.cpp
+    src/modules/sndmod/spu2.cpp
+    src/native_audio.cpp
 )
 
 target_compile_features(ps2_iop PUBLIC cxx_std_20)

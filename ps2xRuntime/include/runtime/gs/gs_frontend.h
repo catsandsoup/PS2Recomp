@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -130,6 +131,17 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // Latch a presentation and return exactly that frame (packed rows). With the GS thread
+    // this waits for the frame to be delivered; used by frame dumps only.
+    bool latchHostPresentationFrameAndCopy(std::vector<uint8_t> &outPixels, uint32_t &outWidth, uint32_t &outHeight);
+    // Wait until every queued GS command has been rasterised (debug VRAM reads).
+    void waitForRasterIdle();
+    static std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend();
+    // Set once the game presents through its own buffer swap (sceGsSwapDBuffDc); the host
+    // render loop then only displays the last game-latched frame instead of sampling mid-draw.
+    void setGameDrivenPresentation(bool enabled) { m_gameDrivenPresentation.store(enabled, std::memory_order_release); }
+    bool gameDrivenPresentation() const { return m_gameDrivenPresentation.load(std::memory_order_acquire); }
+    uint64_t hostPresentationSerial() const { return m_hostPresentationSerial.load(std::memory_order_acquire); }
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -149,6 +161,24 @@ public:
     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
 
 private:
+    struct HostFrameCapture
+    {
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        bool ok = false;
+    };
+    struct PendingPresentDebugEvent
+    {
+        uint32_t displayFbp;
+        uint32_t sourceFbp;
+        uint32_t width;
+        uint32_t height;
+        bool usedPreferred;
+    };
+    void deliverHostPresentationFrame(PresentationFrame &&frame, HostFrameCapture *capture);
+    void flushPendingPresentDebugEventsUnlocked();
+    static bool packHostFrame(const std::vector<uint8_t> &src, uint32_t width, uint32_t height, std::vector<uint8_t> &outPixels);
     void snapshotVRAM();
     void writeRegisterUnlocked(uint8_t regAddr, uint64_t value);
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
@@ -209,6 +239,8 @@ private:
     GSTrxPos m_trxpos{};
     GSTrxReg m_trxreg{};
     uint32_t m_trxdir = 3;
+    uint32_t m_debugTransferDirection = 3;   // producer-side mirror of the backend transfer state
+    uint32_t m_debugTransferTotalPixels = 0; // (debug history only; never waits for the GS thread)
 
 
     static constexpr int kMaxVerts = 6;
@@ -229,6 +261,9 @@ private:
     uint32_t m_hostPresentationSourceFbp = 0;
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
+    std::atomic<bool> m_gameDrivenPresentation{false};
+    std::atomic<uint64_t> m_hostPresentationSerial{0u};
+    std::vector<PendingPresentDebugEvent> m_pendingPresentDebugEvents; // guarded by m_presentationMutex
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
 
@@ -241,6 +276,8 @@ private:
     uint64_t m_debugLastVsyncTick = UINT64_MAX;
     bool m_debugHistoryPaused = true;
 
+    // Must stay the last member: it is destroyed first, so a GS thread delivering into the
+    // presentation mailbox above is joined before those members go away.
     std::unique_ptr<GSRasterBackend> m_backend;
 };
 

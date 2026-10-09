@@ -3,6 +3,8 @@
 #include "runtime/gs/gs_types.h"
 
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include <vector>
 
 class GSRasterBackend
@@ -23,6 +25,19 @@ public:
     virtual void TextureFlush() = 0;
     virtual void Sync(GSSyncReason reason) = 0;
     virtual PresentationFrame Present(const GSPresentationRequest &request) = 0;
+
+    // Presentation captured in stream order. A backend that rasterises on its own thread
+    // (GSThreadedBackend) queues the request behind every earlier command and runs `done`
+    // on that thread once the frame exists; `done` must not take GS frontend state locks.
+    // Returns false when the backend only presents synchronously; the caller then uses
+    // Present() and `done` is not called.
+    using PresentCallback = std::function<void(PresentationFrame &&)>;
+    virtual bool PresentAsync(const GSPresentationRequest &request, PresentCallback done)
+    {
+        (void)request;
+        (void)done;
+        return false;
+    }
 
     virtual bool ClearFramebuffer(const GSContext &context, uint32_t rgba) = 0;
     virtual uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) = 0;
