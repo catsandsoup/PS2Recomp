@@ -134,6 +134,8 @@ namespace ps2_test
         bool g_liveSocket = false;
         Pads g_serverPads;
         bool g_paused = false; // a host menu is open
+        PausedWorkHandler g_pausedWorkHandler;
+        bool g_pausedWorkPending = false;
         uint32_t g_pausedSteps = 0; // frames to let through while paused
         // Vibration per port (any thread reads, the EE thread writes).
         std::mutex g_actMutex;
@@ -421,6 +423,21 @@ namespace ps2_test
         g_parkCv.notify_all();
     }
 
+    void setPausedWorkHandler(PausedWorkHandler handler)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_pausedWorkHandler = std::move(handler);
+        g_pausedWorkPending = true;
+        g_parkCv.notify_all();
+    }
+
+    void notifyPausedWork()
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_pausedWorkPending = true;
+        g_parkCv.notify_all();
+    }
+
     void stepPaused(uint32_t vblanks)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -483,10 +500,23 @@ namespace ps2_test
                     --g_pausedSteps;
                     break;
                 }
-                // Wakes regularly as well, so closing the window while paused still stops the game.
+                // App work executes on this EE thread without advancing a guest
+                // frame. Release the harness lock so the callback can query pause
+                // state or accept another host request without lock inversion.
+                // A notification arriving during work remains pending for the
+                // next iteration instead of being lost before the wait.
+                const auto handler = g_pausedWorkHandler;
+                g_pausedWorkPending = false;
+                if (handler)
+                {
+                    lock.unlock();
+                    handler(runtime);
+                    lock.lock();
+                }
+                // Wakes regularly for app views and window-close/stop handling.
                 g_parkCv.wait_for(lock, std::chrono::milliseconds(100),
-                                  [&] { return !g_paused || g_pausedSteps > 0 || (g_attached && !g_liveSocket) ||
-                                               runtime.isStopRequested(); });
+                                  [&] { return !g_paused || g_pausedSteps > 0 || g_pausedWorkPending ||
+                                               (g_attached && !g_liveSocket) || runtime.isStopRequested(); });
             }
             g_currentVblank = vblank;
             bool scripted = false;

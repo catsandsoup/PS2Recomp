@@ -60,6 +60,14 @@ namespace ps2_test
     // resumed, so the picture holds and nothing advances. Ignored while a test client is attached.
     void setPaused(bool paused);
     bool paused();
+    // Register before run(), clear after run() has joined its EE thread. Called
+    // only on the EE thread inside the host-menu pause hold, with the harness
+    // mutex released. The handler must not advance guest execution or throw.
+    // A handler runs on entry and about every 100 ms while held; notify wakes it
+    // sooner for app requests. Lockstep test-client parking does not call it.
+    using PausedWorkHandler = std::function<void(PS2Runtime &)>;
+    void setPausedWorkHandler(PausedWorkHandler handler);
+    void notifyPausedWork();
     // While paused: let `vblanks` frames through (e.g. so a changed picture setting shows), then hold again.
     void stepPaused(uint32_t vblanks);
     // Adds a marker to the movie being recorded (any thread).

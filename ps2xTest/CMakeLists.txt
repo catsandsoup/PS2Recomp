@@ -8,6 +8,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(gs_cache)
+    add_executable(paused_work_test src/paused_work_test.cpp src/test_function_table.cpp)
+    target_include_directories(paused_work_test PRIVATE ${CMAKE_SOURCE_DIR}/ps2xRuntime/include)
+    target_link_libraries(paused_work_test PRIVATE ps2_runtime)
+    add_test(NAME paused_work COMMAND paused_work_test)
+    set_tests_properties(paused_work PROPERTIES TIMEOUT 15)
 endif()
 
 # Static library with test logic (no main), used by ps2xStudio
